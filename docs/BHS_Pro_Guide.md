@@ -1,6 +1,6 @@
 # BHS Pro DCTL Pack — Guide
 
-25 DCTLs for DaVinci Resolve, built on one shared film-style color engine. They sit alongside the lighter tools in `dctl/color`, `dctl/looks`, `dctl/effects` and `dctl/exposure`.
+26 DCTLs for DaVinci Resolve, built on one shared film-style color engine. They sit alongside the lighter tools in `dctl/color`, `dctl/looks`, `dctl/effects` and `dctl/exposure`.
 
 ## Install
 
@@ -27,7 +27,7 @@ With every control at neutral, each tool passes the picture through unchanged.
 **Rec.709 timeline (simplest)**
 
 1. `U5 Camera Input` → Output: Rec.709 Picture (skip if the footage is already Rec.709)
-2. `D6 Exposure and Balance`
+2. `D6 Exposure and Balance`, then `D7 Exposure Pro` for tonal balance
 3. `D4 Skin Refine` (optional)
 4. One look: `A1 Film Lab`, `B1 Looks`, `B2 Inspo Looks` or `B3 Clean Lifestyle`
 5. Fine tuning: `C1 Density`, `D1 Vectors HSL`, `D3 Split Tone`
@@ -88,6 +88,7 @@ All three share the same trims: **Strength**, **Tone Amount** and **Color Amount
 | `D4 Skin Refine` | Finds skin by hue, then evens and enriches it. **Shadow Richness** keeps deep skin tones from going gray. **Show Skin Mask** shows what is being treated. |
 | `D5 Film Curve` | Contrast with a soft toe and shoulder. Film RGB enriches color; Luma Only leaves saturation alone. |
 | `D6 Exposure and Balance` | Exposure in stops, temperature, tint and printer lights (12 points = 1 stop). |
+| `D7 Exposure Pro` | Exposure, contrast with pivot, whites, highlights, midtones, shadows, blacks, highlight rolloff and saturation, with False Color, Clipping Warning and Zone Mask views built in. |
 
 ### E — Texture
 

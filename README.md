@@ -8,13 +8,13 @@ Free, open-source DCTLs for DaVinci Resolve by **Behappystudiox** (BHS), made fo
 
 | Tool | Folder | What it does |
 |---|---|---|
-| **BHS Exposure Pro** | `dctl/exposure` | Exposure (stops), contrast + pivot, whites, highlights, midtones, shadows, blacks, highlight roll-off, saturation. Built-in False Color, Clipping Warning and Zone Mask views. |
+| **BHS Pro Exposure Pro** | `dctl/pro` | Exposure (stops), contrast + pivot, whites, highlights, midtones, shadows, blacks, highlight rolloff, saturation. Built-in False Color, Clipping Warning and Zone Mask views. Same color core as the rest of BHS Pro. |
 | **BHS Film Print Look** | `dctl/looks` | Film-style tone curve, dye crosstalk, tinted shadows/highlights, highlight desaturation. |
 | **BHS Split Tone** | `dctl/color` | Tint shadows and highlights with two hues while keeping brightness. |
 | **BHS Skin Vibrance** | `dctl/color` | Boosts dull colors, leaves skin tones alone. |
 | **BHS Vignette** | `dctl/effects` | Darken or lighten edges, with highlight protection. |
 
-## BHS Pro pack (25 tools)
+## BHS Pro pack (26 tools)
 
 A full film-style toolset built on one shared color engine, in `dctl/pro`. Full documentation: **[docs/BHS_Pro_Guide.md](docs/BHS_Pro_Guide.md)**.
 
@@ -23,7 +23,7 @@ A full film-style toolset built on one shared color engine, in `dctl/pro`. Full 
 | **Film** | A1 Film Lab (17 negative stocks x 6 print stocks), A2 Mono Film |
 | **Looks** | B1 Looks (20 finished looks), B2 Inspo Looks, B3 Clean Lifestyle |
 | **Density & color** | C1 Density, C2 Subtractive Saturation, C3 Color Separation, C4 Crosstalk |
-| **Color tools** | D1 Vectors HSL, D2 Tetra, D3 Split Tone, D4 Skin Refine, D5 Film Curve, D6 Exposure and Balance |
+| **Color tools** | D1 Vectors HSL, D2 Tetra, D3 Split Tone, D4 Skin Refine, D5 Film Curve, D6 Exposure and Balance, **D7 Exposure Pro** |
 | **Texture** | E1 Grain, E2 Halation, E3 Bloom and Mist, E4 Vignette |
 | **Utility** | U1 False Color, U2 Scope Views, U3 Test Chart, U4 Gamut Compress, U5 Camera Input (14 camera log formats), U6 Display Output |
 
@@ -65,8 +65,8 @@ Rendered on a synthetic test scene (left = input, right = result). Settings used
 ## Exposure Pro quick start
 
 1. Put it on its own node before your look.
-2. Set **Input Space** to match the footage (Linear, Gamma24, or DaVinciInt).
-3. Set **View Mode** to *FalseColor* and adjust Exposure until skin and mid-grey sit where you want them; use *ClipWarning* to protect highlights and blacks.
+2. Set **Working Space** to match what the node is being fed (Rec.709 Gamma 2.4, DaVinci WG Intermediate, or ACEScct).
+3. Set **View Mode** to *False Color* and adjust Exposure until skin and mid-grey sit where you want them; use *Clipping Warning* to protect highlights and blacks.
 4. Set View Mode back to **Off**.
 
 ## Contributing

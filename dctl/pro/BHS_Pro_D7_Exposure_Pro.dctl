@@ -1,0 +1,245 @@
+// BHS Pro - Exposure Pro
+// Full exposure and tonal balance on one node: Exposure in real stops, Contrast with a pivot,
+// Whites, Highlights, Midtones, Shadows and Blacks, Highlight Rolloff and Saturation, with built-in
+// False Color, Clipping Warning and Zone Mask views so you can see what you are doing.
+// All tonal moves work on brightness only, so hue and color stay where they were.
+// Use View Mode to judge the exposure, then set it back to Off.
+
+DEFINE_UI_PARAMS(ws, Working Space, DCTLUI_COMBO_BOX, 0, { WS_709, WS_DWG, WS_ACES }, { Rec.709 Gamma 2.4, DaVinci WG Intermediate, ACEScct })
+DEFINE_UI_TOOLTIP(Working Space, "What this node is being fed. Use Rec.709 after your conversion to Rec.709 or DaVinci WG Intermediate in a wide gamut timeline.")
+DEFINE_UI_PARAMS(expo, Exposure, DCTLUI_SLIDER_FLOAT, 0.0, -6.0, 6.0, 0.01)
+DEFINE_UI_PARAMS(contrast, Contrast, DCTLUI_SLIDER_FLOAT, 1.0, 0.5, 2.0, 0.01)
+DEFINE_UI_PARAMS(pivot, Contrast Pivot, DCTLUI_SLIDER_FLOAT, 0.18, 0.02, 0.6, 0.005)
+DEFINE_UI_PARAMS(whites, Whites, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(highlights, Highlights, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(midtones, Midtones, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(shadows, Shadows, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(blacks, Blacks, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(rolloff, Highlight Rolloff, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(rollStart, Rolloff Start, DCTLUI_SLIDER_FLOAT, 0.6, 0.2, 0.95, 0.01)
+DEFINE_UI_PARAMS(sat, Saturation, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+DEFINE_UI_PARAMS(viewMode, View Mode, DCTLUI_COMBO_BOX, 0, { VM_OFF, VM_FALSE, VM_CLIP, VM_ZONES }, { Off, False Color, Clipping Warning, Zone Masks })
+DEFINE_UI_TOOLTIP(Exposure, "Exposure in stops.")
+DEFINE_UI_TOOLTIP(Contrast, "Contrast around the pivot. 1 is neutral.")
+DEFINE_UI_TOOLTIP(Contrast Pivot, "The scene brightness that contrast leaves alone. 0.18 is mid gray.")
+DEFINE_UI_TOOLTIP(Whites, "Brightens or darkens the very top of the picture.")
+DEFINE_UI_TOOLTIP(Highlights, "Brightens or darkens the bright areas. Pull left to recover bright skies and lights.")
+DEFINE_UI_TOOLTIP(Midtones, "Brightens or darkens the middle of the picture, where skin usually sits.")
+DEFINE_UI_TOOLTIP(Shadows, "Brightens or darkens the dark areas. Push right to open up shadows.")
+DEFINE_UI_TOOLTIP(Blacks, "Lifts or crushes the deepest blacks.")
+DEFINE_UI_TOOLTIP(Highlight Rolloff, "Softly compresses the brightest values instead of letting them clip.")
+DEFINE_UI_TOOLTIP(Rolloff Start, "Where the rolloff begins. Lower starts earlier and is gentler.")
+DEFINE_UI_TOOLTIP(Saturation, "Overall color. 1 is neutral.")
+DEFINE_UI_TOOLTIP(View Mode, "False Color maps exposure zones. Clipping Warning shows blown highlights in magenta and crushed blacks in blue. Zone Masks shows red for highlights, green for midtones and blue for shadows. Set to Off when finished.")
+
+// ---------------------------------------------------------------------------
+// BHS Pro color core
+// Every BHS Pro tool does its maths in one internal space: a film-style log
+// encoding (the DaVinci Intermediate curve) on Rec.709 primaries. Working in
+// log on display primaries is how film-print grading behaves: colors get denser
+// instead of neon, and results stay inside the Rec.709 range by construction.
+// "Working Space" tells the tool what it is being fed; it converts in, does the
+// work, and hands back the same space. With every control at neutral the
+// picture passes through unchanged.
+// ---------------------------------------------------------------------------
+
+__DEVICE__ float bhs_smooth(float e0, float e1, float x)
+{
+    float t = _clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// DaVinci Intermediate log curve
+__DEVICE__ float bhs_di_enc(float v)
+{
+    return v > 0.00262409f ? (_log2f(v + 0.0075f) + 7.0f) * 0.07329248f : v * 10.44426855f;
+}
+
+__DEVICE__ float bhs_di_dec(float v)
+{
+    return v > 0.02740668f ? _exp2f(v / 0.07329248f - 7.0f) - 0.0075f : v / 10.44426855f;
+}
+
+// ACEScct log curve
+__DEVICE__ float bhs_cct_enc(float v)
+{
+    return v > 0.0078125f ? (_log2f(v) + 9.72f) / 17.52f : 10.5402377416545f * v + 0.0729055341958355f;
+}
+
+__DEVICE__ float bhs_cct_dec(float v)
+{
+    return v > 0.155251141552511f ? _exp2f(v * 17.52f - 9.72f) : (v - 0.0729055341958355f) / 10.5402377416545f;
+}
+
+// Display gamma 2.4, mirrored for values below zero
+__DEVICE__ float bhs_g24_dec(float v)
+{
+    return v < 0.0f ? -_powf(-v, 2.4f) : _powf(v, 2.4f);
+}
+
+__DEVICE__ float bhs_g24_enc(float v)
+{
+    return v < 0.0f ? -_powf(-v, 0.4166667f) : _powf(v, 0.4166667f);
+}
+
+// Display light <-> estimated scene light. A soft, exactly invertible highlight
+// rolloff, so exposure and contrast moves made on a Rec.709 image roll off
+// gently instead of clipping. Display 0.12 (about 41 IRE) maps to scene 0.18.
+__DEVICE__ float bhs_unroll(float y)
+{
+    if (y <= 0.0f) return y * 1.3333333f;
+    if (y >= 1.0f) return 28.0f + (y - 1.0f) * 588.0f;
+    return 1.4f * y / (1.05f - y);
+}
+
+__DEVICE__ float bhs_roll(float x)
+{
+    if (x <= 0.0f) return x * 0.75f;
+    if (x >= 28.0f) return 1.0f + (x - 28.0f) / 588.0f;
+    return 1.05f * x / (x + 1.4f);
+}
+
+// Working space -> internal.  ws: 0 = Rec.709 Gamma 2.4, 1 = DaVinci WG / Intermediate, 2 = ACEScct
+__DEVICE__ float3 bhs_in(float3 c, int ws)
+{
+    float r, g, b;
+    if (ws == 0) {
+        r = bhs_unroll(bhs_g24_dec(c.x));
+        g = bhs_unroll(bhs_g24_dec(c.y));
+        b = bhs_unroll(bhs_g24_dec(c.z));
+    } else if (ws == 1) {
+        float lr = bhs_di_dec(c.x);
+        float lg = bhs_di_dec(c.y);
+        float lb = bhs_di_dec(c.z);
+        r =  1.89861490f * lr - 0.79217618f * lg - 0.10643872f * lb;
+        g = -0.16894879f * lr + 1.48897575f * lg - 0.32002697f * lb;
+        b = -0.12153916f * lr - 0.31567585f * lg + 1.43721501f * lb;
+    } else {
+        float lr = bhs_cct_dec(c.x);
+        float lg = bhs_cct_dec(c.y);
+        float lb = bhs_cct_dec(c.z);
+        r =  1.70505099f * lr - 0.62179212f * lg - 0.08325887f * lb;
+        g = -0.13025642f * lr + 1.14080474f * lg - 0.01054832f * lb;
+        b = -0.02400336f * lr - 0.12896898f * lg + 1.15297233f * lb;
+    }
+    return make_float3(bhs_di_enc(r), bhs_di_enc(g), bhs_di_enc(b));
+}
+
+// The part of an internal color the tools work on. Anything below zero (colors
+// outside Rec.709 in a wide gamut grade) is set aside and added back untouched
+// by bhs_out, so nothing is lost and the tools never see invalid values.
+__DEVICE__ float3 bhs_pos(float3 c)
+{
+    return make_float3(_fmaxf(c.x, 0.0f), _fmaxf(c.y, 0.0f), _fmaxf(c.z, 0.0f));
+}
+
+// Internal -> working space. res: processed color. orig: what bhs_in returned.
+__DEVICE__ float3 bhs_out(float3 res, float3 orig, int ws)
+{
+    float r = bhs_di_dec(res.x + _fminf(orig.x, 0.0f));
+    float g = bhs_di_dec(res.y + _fminf(orig.y, 0.0f));
+    float b = bhs_di_dec(res.z + _fminf(orig.z, 0.0f));
+    if (ws == 0) {
+        return make_float3(bhs_g24_enc(bhs_roll(r)), bhs_g24_enc(bhs_roll(g)), bhs_g24_enc(bhs_roll(b)));
+    }
+    if (ws == 1) {
+        float lr = 0.56276746f * r + 0.32351659f * g + 0.11371596f * b;
+        float lg = 0.07775464f * r + 0.74957735f * g + 0.17266802f * b;
+        float lb = 0.06466920f * r + 0.19199869f * g + 0.74333211f * b;
+        return make_float3(bhs_di_enc(lr), bhs_di_enc(lg), bhs_di_enc(lb));
+    }
+    float ar = 0.61309740f * r + 0.33952315f * g + 0.04737945f * b;
+    float ag = 0.07019372f * r + 0.91635388f * g + 0.01345240f * b;
+    float ab = 0.02061559f * r + 0.10956977f * g + 0.86981463f * b;
+    return make_float3(bhs_cct_enc(ar), bhs_cct_enc(ag), bhs_cct_enc(ab));
+}
+
+// False color map for a display lightness e (0..1): purple, blue, teal, gray, green (mid gray),
+// gray, pink (bright skin), yellow, orange, red.
+__DEVICE__ float3 bhs_zone_color(float e)
+{
+    float3 o = make_float3(e, e, e);
+    if (e < 0.02f) o = make_float3(0.35f, 0.0f, 0.55f);
+    else if (e < 0.08f) o = make_float3(0.0f, 0.15f, 0.85f);
+    else if (e < 0.25f) o = make_float3(0.0f, 0.6f, 0.75f);
+    else if (e < 0.38f) o = make_float3(e, e, e);
+    else if (e < 0.47f) o = make_float3(0.0f, 0.75f, 0.2f);
+    else if (e < 0.62f) o = make_float3(e, e, e);
+    else if (e < 0.75f) o = make_float3(0.95f, 0.6f, 0.7f);
+    else if (e < 0.88f) o = make_float3(1.0f, 0.9f, 0.1f);
+    else if (e < 0.97f) o = make_float3(1.0f, 0.5f, 0.0f);
+    else o = make_float3(1.0f, 0.0f, 0.0f);
+    return o;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float3 nat = bhs_in(make_float3(p_R, p_G, p_B), ws);
+    float3 src = bhs_pos(nat);
+
+    // Scene light, then exposure in stops
+    float e = _exp2f(expo);
+    float cr = bhs_di_dec(src.x) * e;
+    float cg = bhs_di_dec(src.y) * e;
+    float cb = bhs_di_dec(src.z) * e;
+
+    // Luminance, and the display lightness the tonal masks are built on
+    float y = _fmaxf(0.2126f * cr + 0.7152f * cg + 0.0722f * cb, 0.0f);
+    float ld = bhs_g24_enc(bhs_roll(y));
+
+    float mBlacks = 1.0f - bhs_smooth(0.0f, 0.22f, ld);
+    float mShadows = 1.0f - bhs_smooth(0.12f, 0.58f, ld);
+    float mMid = 1.0f - _fabs(2.0f * ld - 1.0f);
+    mMid = mMid * mMid * (3.0f - 2.0f * mMid);
+    float mHighs = bhs_smooth(0.42f, 0.9f, ld);
+    float mWhites = bhs_smooth(0.72f, 1.0f, ld);
+
+    // One brightness gain in stops (a slider at 1 is 2 stops at full mask), then contrast
+    float stops = 2.0f * (shadows * mShadows + midtones * mMid + highlights * mHighs + whites * mWhites);
+    float gain = _exp2f(stops);
+    if (y > 0.000001f) gain = gain * _powf(y / pivot, contrast - 1.0f);
+
+    float yNew = _fmaxf(y * gain + blacks * 0.02f * mBlacks, 0.0f);
+
+    // Highlight rolloff: soft knee toward 1.0
+    if (rolloff > 0.0f && yNew > rollStart) {
+        float range = 1.0f - rollStart;
+        float soft = rollStart + range * (1.0f - _expf(-(yNew - rollStart) / range));
+        yNew = yNew + (soft - yNew) * rolloff;
+    }
+
+    // Apply the brightness change to color
+    float r = yNew;
+    float g = yNew;
+    float b = yNew;
+    if (y > 0.000001f) {
+        float k = yNew / y;
+        r = cr * k;
+        g = cg * k;
+        b = cb * k;
+    }
+
+    // Saturation around brightness
+    float yo = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    r = _fmaxf(yo + (r - yo) * sat, 0.0f);
+    g = _fmaxf(yo + (g - yo) * sat, 0.0f);
+    b = _fmaxf(yo + (b - yo) * sat, 0.0f);
+
+    float3 fin = bhs_out(make_float3(bhs_di_enc(r), bhs_di_enc(g), bhs_di_enc(b)), nat, ws);
+
+    // Analysis views, drawn from the finished result
+    float eo = bhs_g24_enc(bhs_roll(0.2126f * r + 0.7152f * g + 0.0722f * b));
+    if (viewMode == 1) {
+        fin = bhs_zone_color(eo);
+    } else if (viewMode == 2) {
+        if (eo >= 0.98f) fin = make_float3(1.0f, 0.0f, 0.6f);
+        else if (eo <= 0.005f) fin = make_float3(0.0f, 0.2f, 1.0f);
+    } else if (viewMode == 3) {
+        float sh = 1.0f - bhs_smooth(0.12f, 0.58f, eo);
+        float hi = bhs_smooth(0.42f, 0.9f, eo);
+        float mi = 1.0f - _fabs(2.0f * eo - 1.0f);
+        fin = make_float3(hi, mi * mi * (3.0f - 2.0f * mi), sh);
+    }
+
+    return make_float3(fin.x, fin.y, fin.z);
+}
