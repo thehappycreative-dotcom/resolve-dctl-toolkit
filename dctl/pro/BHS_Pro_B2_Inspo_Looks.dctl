@@ -1,0 +1,546 @@
+// BHS Pro - Inspo Looks
+// Looks matched to the reference frames: deep teal skies, golden yellows, rust and olive earth tones, rich skin.
+// Pick a look, then trim it. Strength scales the whole look; Tone Amount and Color Amount
+// let you take only the contrast or only the color from a look.
+// Skin Protect holds skin tones closer to how they came in.
+
+DEFINE_UI_PARAMS(ws, Working Space, DCTLUI_COMBO_BOX, 0, { WS_709, WS_DWG, WS_ACES }, { Rec.709 Gamma 2.4, DaVinci WG Intermediate, ACEScct })
+DEFINE_UI_TOOLTIP(Working Space, "What this node is being fed. Use Rec.709 after your conversion to Rec.709 or DaVinci WG Intermediate in a wide gamut timeline.")
+DEFINE_UI_PARAMS(look, Look, DCTLUI_COMBO_BOX, 0, { LK_0, LK_1, LK_2, LK_3, LK_4, LK_5, LK_6, LK_7, LK_8 }, { Danfo Teal, Danfo Teal Soft, Market Dusk, Market Dusk Lifted, Earth Walk, Rust and Olive, Backyard Gold, Aqua Sky Vintage, Rich Skin })
+DEFINE_UI_PARAMS(strength, Strength, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(toneAmt, Tone Amount, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(colAmt, Color Amount, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(expo, Exposure, DCTLUI_SLIDER_FLOAT, 0.0, -3.0, 3.0, 0.01)
+DEFINE_UI_PARAMS(con, Contrast, DCTLUI_SLIDER_FLOAT, 1.0, 0.5, 1.8, 0.01)
+DEFINE_UI_PARAMS(sat, Saturation, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+DEFINE_UI_PARAMS(dens, Density, DCTLUI_SLIDER_FLOAT, 0.0, -0.5, 1.0, 0.01)
+DEFINE_UI_PARAMS(warm, Warmth, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(tint, Tint, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(fade, Fade, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(skinKeep, Skin Protect, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
+DEFINE_UI_TOOLTIP(Strength, "Overall amount of the look. 0 is off and 1 is the look as designed.")
+DEFINE_UI_TOOLTIP(Tone Amount, "How much of the look contrast and fade to use.")
+DEFINE_UI_TOOLTIP(Color Amount, "How much of the look color to use.")
+DEFINE_UI_TOOLTIP(Exposure, "Exposure in stops. Highlights roll off instead of clipping.")
+DEFINE_UI_TOOLTIP(Density, "Darkens and deepens colorful areas the way film dye does.")
+DEFINE_UI_TOOLTIP(Skin Protect, "Keeps skin tones closer to the original color.")
+
+// ---------------------------------------------------------------------------
+// BHS Pro color core
+// Every BHS Pro tool does its maths in one internal space: a film-style log
+// encoding (the DaVinci Intermediate curve) on Rec.709 primaries. Working in
+// log on display primaries is how film-print grading behaves: colors get denser
+// instead of neon, and results stay inside the Rec.709 range by construction.
+// "Working Space" tells the tool what it is being fed; it converts in, does the
+// work, and hands back the same space. With every control at neutral the
+// picture passes through unchanged.
+// ---------------------------------------------------------------------------
+
+__DEVICE__ float bhs_smooth(float e0, float e1, float x)
+{
+    float t = _clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// DaVinci Intermediate log curve
+__DEVICE__ float bhs_di_enc(float v)
+{
+    return v > 0.00262409f ? (_log2f(v + 0.0075f) + 7.0f) * 0.07329248f : v * 10.44426855f;
+}
+
+__DEVICE__ float bhs_di_dec(float v)
+{
+    return v > 0.02740668f ? _exp2f(v / 0.07329248f - 7.0f) - 0.0075f : v / 10.44426855f;
+}
+
+// ACEScct log curve
+__DEVICE__ float bhs_cct_enc(float v)
+{
+    return v > 0.0078125f ? (_log2f(v) + 9.72f) / 17.52f : 10.5402377416545f * v + 0.0729055341958355f;
+}
+
+__DEVICE__ float bhs_cct_dec(float v)
+{
+    return v > 0.155251141552511f ? _exp2f(v * 17.52f - 9.72f) : (v - 0.0729055341958355f) / 10.5402377416545f;
+}
+
+// Display gamma 2.4, mirrored for values below zero
+__DEVICE__ float bhs_g24_dec(float v)
+{
+    return v < 0.0f ? -_powf(-v, 2.4f) : _powf(v, 2.4f);
+}
+
+__DEVICE__ float bhs_g24_enc(float v)
+{
+    return v < 0.0f ? -_powf(-v, 0.4166667f) : _powf(v, 0.4166667f);
+}
+
+// Display light <-> estimated scene light. A soft, exactly invertible highlight
+// rolloff, so exposure and contrast moves made on a Rec.709 image roll off
+// gently instead of clipping. Display 0.12 (about 41 IRE) maps to scene 0.18.
+__DEVICE__ float bhs_unroll(float y)
+{
+    if (y <= 0.0f) return y * 1.3333333f;
+    if (y >= 1.0f) return 28.0f + (y - 1.0f) * 588.0f;
+    return 1.4f * y / (1.05f - y);
+}
+
+__DEVICE__ float bhs_roll(float x)
+{
+    if (x <= 0.0f) return x * 0.75f;
+    if (x >= 28.0f) return 1.0f + (x - 28.0f) / 588.0f;
+    return 1.05f * x / (x + 1.4f);
+}
+
+// Working space -> internal.  ws: 0 = Rec.709 Gamma 2.4, 1 = DaVinci WG / Intermediate, 2 = ACEScct
+__DEVICE__ float3 bhs_in(float3 c, int ws)
+{
+    float r, g, b;
+    if (ws == 0) {
+        r = bhs_unroll(bhs_g24_dec(c.x));
+        g = bhs_unroll(bhs_g24_dec(c.y));
+        b = bhs_unroll(bhs_g24_dec(c.z));
+    } else if (ws == 1) {
+        float lr = bhs_di_dec(c.x);
+        float lg = bhs_di_dec(c.y);
+        float lb = bhs_di_dec(c.z);
+        r =  1.89861490f * lr - 0.79217618f * lg - 0.10643872f * lb;
+        g = -0.16894879f * lr + 1.48897575f * lg - 0.32002697f * lb;
+        b = -0.12153916f * lr - 0.31567585f * lg + 1.43721501f * lb;
+    } else {
+        float lr = bhs_cct_dec(c.x);
+        float lg = bhs_cct_dec(c.y);
+        float lb = bhs_cct_dec(c.z);
+        r =  1.70505099f * lr - 0.62179212f * lg - 0.08325887f * lb;
+        g = -0.13025642f * lr + 1.14080474f * lg - 0.01054832f * lb;
+        b = -0.02400336f * lr - 0.12896898f * lg + 1.15297233f * lb;
+    }
+    return make_float3(bhs_di_enc(r), bhs_di_enc(g), bhs_di_enc(b));
+}
+
+// The part of an internal color the tools work on. Anything below zero (colors
+// outside Rec.709 in a wide gamut grade) is set aside and added back untouched
+// by bhs_out, so nothing is lost and the tools never see invalid values.
+__DEVICE__ float3 bhs_pos(float3 c)
+{
+    return make_float3(_fmaxf(c.x, 0.0f), _fmaxf(c.y, 0.0f), _fmaxf(c.z, 0.0f));
+}
+
+// Internal -> working space. res: processed color. orig: what bhs_in returned.
+__DEVICE__ float3 bhs_out(float3 res, float3 orig, int ws)
+{
+    float r = bhs_di_dec(res.x + _fminf(orig.x, 0.0f));
+    float g = bhs_di_dec(res.y + _fminf(orig.y, 0.0f));
+    float b = bhs_di_dec(res.z + _fminf(orig.z, 0.0f));
+    if (ws == 0) {
+        return make_float3(bhs_g24_enc(bhs_roll(r)), bhs_g24_enc(bhs_roll(g)), bhs_g24_enc(bhs_roll(b)));
+    }
+    if (ws == 1) {
+        float lr = 0.56276746f * r + 0.32351659f * g + 0.11371596f * b;
+        float lg = 0.07775464f * r + 0.74957735f * g + 0.17266802f * b;
+        float lb = 0.06466920f * r + 0.19199869f * g + 0.74333211f * b;
+        return make_float3(bhs_di_enc(lr), bhs_di_enc(lg), bhs_di_enc(lb));
+    }
+    float ar = 0.61309740f * r + 0.33952315f * g + 0.04737945f * b;
+    float ag = 0.07019372f * r + 0.91635388f * g + 0.01345240f * b;
+    float ab = 0.02061559f * r + 0.10956977f * g + 0.86981463f * b;
+    return make_float3(bhs_cct_enc(ar), bhs_cct_enc(ag), bhs_cct_enc(ab));
+}
+
+// Brightness of an internal (log) color.  Mid gray = 0.336, one stop = 0.0733
+__DEVICE__ float bhs_luma(float r, float g, float b)
+{
+    return 0.24f * r + 0.68f * g + 0.08f * b;
+}
+
+// Hue angle in degrees and colorfulness of an internal color.
+// 0 red, 20 skin, 30 orange, 50 yellow, 90 foliage, 125 green, 180 teal and cyan,
+// 215 sky, 235 blue, 270 purple, 310 magenta, 340 pink.
+__DEVICE__ float bhs_hue(float r, float g, float b)
+{
+    float a = r - 0.5f * (g + b);
+    float q = 0.8660254f * (g - b);
+    if (_fabs(a) + _fabs(q) < 1.0e-7f) return 0.0f;
+    float h = _atan2f(q, a) * 57.2957795f;
+    return h < 0.0f ? h + 360.0f : h;
+}
+
+__DEVICE__ float bhs_chroma(float r, float g, float b)
+{
+    float a = r - 0.5f * (g + b);
+    float q = 0.8660254f * (g - b);
+    return _sqrtf(a * a + q * q);
+}
+
+// Shortest distance between two hue angles, in degrees
+__DEVICE__ float bhs_hue_dist(float h1, float h2)
+{
+    float d = _fabs(h1 - h2);
+    return d > 180.0f ? 360.0f - d : d;
+}
+
+// How strongly a pixel counts as skin, 0..1 (hue near 20 degrees, moderate colorfulness)
+__DEVICE__ float bhs_skin(float r, float g, float b)
+{
+    float h = bhs_hue(r, g, b);
+    float ch = bhs_chroma(r, g, b);
+    return (1.0f - bhs_smooth(11.0f, 30.0f, bhs_hue_dist(h, 20.0f))) * bhs_smooth(0.03f, 0.09f, ch) * (1.0f - bhs_smooth(0.34f, 0.48f, ch));
+}
+
+// Rotate hue, scale saturation and shift brightness of an internal color.
+// hueDeg: degrees. satGain: multiplier. lumStops: stops, weighted by how colorful
+// the pixel is so grays never move. sub: 0 = plain saturation, 1 = film-style
+// (added saturation makes color deeper, not brighter).
+__DEVICE__ float3 bhs_hsl(float3 c, float hueDeg, float satGain, float lumStops, float sub)
+{
+    float m = (c.x + c.y + c.z) * 0.3333333f;
+    float a = c.x - 0.5f * (c.y + c.z);
+    float q = 0.8660254f * (c.y - c.z);
+    float ch = _sqrtf(a * a + q * q);
+    float rad = hueDeg * 0.01745329f;
+    float cs = _cosf(rad);
+    float sn = _sinf(rad);
+    float ar = a * cs - q * sn;
+    float qr = a * sn + q * cs;
+    float mxr = m + _fmaxf(0.6666667f * ar, _fmaxf(-0.3333333f * ar + 0.5773503f * qr, -0.3333333f * ar - 0.5773503f * qr));
+    float a2 = ar * satGain;
+    float q2 = qr * satGain;
+    float r = m + 0.6666667f * a2;
+    float g = m - 0.3333333f * a2 + 0.5773503f * q2;
+    float b = m - 0.3333333f * a2 - 0.5773503f * q2;
+    float mx2 = _fmaxf(r, _fmaxf(g, b));
+    float cw = 1.0f - _expf(-ch * 5.0f);
+    float d = lumStops * 0.07329248f * cw - sub * _fmaxf(mx2 - mxr, 0.0f) + 0.30f * (bhs_luma(c.x, c.y, c.z) - bhs_luma(m + 0.6666667f * ar, m - 0.3333333f * ar + 0.5773503f * qr, m - 0.3333333f * ar - 0.5773503f * qr));
+    return make_float3(r + d, g + d, b + d);
+}
+
+// Keep a processed channel from dropping below black when the source was not
+__DEVICE__ float3 bhs_floor(float3 res, float3 src)
+{
+    return make_float3((src.x >= 0.0f && res.x < 0.0f) ? 0.0f : res.x, (src.y >= 0.0f && res.y < 0.0f) ? 0.0f : res.y, (src.z >= 0.0f && res.z < 0.0f) ? 0.0f : res.z);
+}
+// Film tone curve on an internal (log) value.
+// pv: pivot (mid grey = 0.336).  con: slope at the pivot.
+// toe: 1 = soft film toe that keeps black at black, 0 = straight line.
+// sho: 0 = no shoulder, 1 = strong highlight rolloff.
+__DEVICE__ float bhs_tone(float x, float pv, float con, float toe, float sho)
+{
+    if (x >= pv) {
+        float d = (x - pv) * con;
+        float u = d * _fmaxf(sho, 0.0f) / 0.30f;
+        return pv + d / _sqrtf(1.0f + u * u);
+    }
+    float anchor = -(1.0f - _clampf(toe, 0.0f, 1.0f)) * 0.6f;
+    float span = pv - anchor;
+    float t = (x - anchor) / span;
+    if (t <= 0.0f) return x;
+    return anchor + span * _powf(t, con);
+}
+// Blend eight per-color settings smoothly around the hue wheel.
+// Order: red (0), orange and skin (24), yellow (50), green (105), cyan and teal (180),
+// blue (228), purple (272), magenta (320).
+__DEVICE__ float3 bhs_vec8(float h, float3 v0, float3 v1, float3 v2, float3 v3, float3 v4, float3 v5, float3 v6, float3 v7)
+{
+    float3 p;
+    float3 n;
+    float t;
+    if (h < 24.0f)       { p = v0; n = v1; t = h / 24.0f; }
+    else if (h < 50.0f)  { p = v1; n = v2; t = (h - 24.0f) / 26.0f; }
+    else if (h < 105.0f) { p = v2; n = v3; t = (h - 50.0f) / 55.0f; }
+    else if (h < 180.0f) { p = v3; n = v4; t = (h - 105.0f) / 75.0f; }
+    else if (h < 228.0f) { p = v4; n = v5; t = (h - 180.0f) / 48.0f; }
+    else if (h < 272.0f) { p = v5; n = v6; t = (h - 228.0f) / 44.0f; }
+    else if (h < 320.0f) { p = v6; n = v7; t = (h - 272.0f) / 48.0f; }
+    else                 { p = v7; n = v0; t = (h - 320.0f) / 40.0f; }
+    t = _clampf(t, 0.0f, 1.0f);
+    t = t * t * (3.0f - 2.0f * t);
+    return make_float3(p.x + (n.x - p.x) * t, p.y + (n.y - p.y) * t, p.z + (n.z - p.z) * t);
+}
+// ---------------------------------------------------------------------------
+// BHS Pro look engine
+// One look = a film-style recipe: tone curve, colour crossover, tinted shadows
+// and highlights, faded blacks, and hue / saturation / density per colour.
+// ---------------------------------------------------------------------------
+typedef struct
+{
+    float expo;     // exposure, stops
+    float con;      // contrast at mid grey
+    float toe;      // 1 soft toe .. 0 hard
+    float sho;      // highlight shoulder 0..1
+    float fade;     // lifted blacks, points
+    float sat;      // saturation
+    float cmax;     // soft ceiling on colourfulness (9 = off)
+    float dens;     // density: darkens colourful pixels, stops
+    float hiSat;    // saturation multiplier in the highlights
+    float loSat;    // saturation multiplier in the shadows
+    float mono;     // 0 colour .. 1 black and white
+    float3 gam;     // contrast per channel (colour crossover)
+    float3 bal;     // overall balance, points
+    float3 shT;     // shadow tint, points
+    float3 hiT;     // highlight tint, points
+    float3 fadeT;   // colour of the lifted blacks, points
+    float3 vR;      // per colour: hue shift (deg), saturation change, brightness (stops)
+    float3 vO;
+    float3 vY;
+    float3 vG;
+    float3 vC;
+    float3 vB;
+    float3 vP;
+    float3 vM;
+} bhs_look;
+
+__DEVICE__ bhs_look bhs_look_init()
+{
+    bhs_look L;
+    L.expo = 0.0f; L.con = 1.0f; L.toe = 1.0f; L.sho = 0.0f; L.fade = 0.0f;
+    L.sat = 1.0f; L.cmax = 9.0f; L.dens = 0.0f; L.hiSat = 1.0f; L.loSat = 1.0f; L.mono = 0.0f;
+    L.gam = make_float3(1.0f, 1.0f, 1.0f);
+    L.bal = make_float3(0.0f, 0.0f, 0.0f);
+    L.shT = make_float3(0.0f, 0.0f, 0.0f);
+    L.hiT = make_float3(0.0f, 0.0f, 0.0f);
+    L.fadeT = make_float3(0.0f, 0.0f, 0.0f);
+    L.vR = make_float3(0.0f, 0.0f, 0.0f);
+    L.vO = make_float3(0.0f, 0.0f, 0.0f);
+    L.vY = make_float3(0.0f, 0.0f, 0.0f);
+    L.vG = make_float3(0.0f, 0.0f, 0.0f);
+    L.vC = make_float3(0.0f, 0.0f, 0.0f);
+    L.vB = make_float3(0.0f, 0.0f, 0.0f);
+    L.vP = make_float3(0.0f, 0.0f, 0.0f);
+    L.vM = make_float3(0.0f, 0.0f, 0.0f);
+    return L;
+}
+
+__DEVICE__ float3 bhs_mul3(float3 v, float k)
+{
+    return make_float3(v.x * k, v.y * k, v.z * k);
+}
+
+// Scale a look: tAmt drives the tone part, cAmt the colour part
+__DEVICE__ bhs_look bhs_look_scale(bhs_look L, float tAmt, float cAmt)
+{
+    L.expo = L.expo * tAmt;
+    L.con = 1.0f + (L.con - 1.0f) * tAmt;
+    L.toe = 1.0f + (L.toe - 1.0f) * tAmt;
+    L.sho = L.sho * tAmt;
+    L.fade = L.fade * tAmt;
+    L.sat = 1.0f + (L.sat - 1.0f) * cAmt;
+    L.cmax = 1.0f / _fmaxf(cAmt / L.cmax, 0.1111111f);
+    L.dens = L.dens * cAmt;
+    L.hiSat = 1.0f + (L.hiSat - 1.0f) * cAmt;
+    L.loSat = 1.0f + (L.loSat - 1.0f) * cAmt;
+    L.mono = L.mono * cAmt;
+    L.gam = make_float3(1.0f + (L.gam.x - 1.0f) * cAmt, 1.0f + (L.gam.y - 1.0f) * cAmt, 1.0f + (L.gam.z - 1.0f) * cAmt);
+    L.bal = bhs_mul3(L.bal, cAmt);
+    L.shT = bhs_mul3(L.shT, cAmt);
+    L.hiT = bhs_mul3(L.hiT, cAmt);
+    L.fadeT = bhs_mul3(L.fadeT, tAmt);
+    L.vR = bhs_mul3(L.vR, cAmt);
+    L.vO = bhs_mul3(L.vO, cAmt);
+    L.vY = bhs_mul3(L.vY, cAmt);
+    L.vG = bhs_mul3(L.vG, cAmt);
+    L.vC = bhs_mul3(L.vC, cAmt);
+    L.vB = bhs_mul3(L.vB, cAmt);
+    L.vP = bhs_mul3(L.vP, cAmt);
+    L.vM = bhs_mul3(L.vM, cAmt);
+    return L;
+}
+
+// Apply a look to an internal (log) colour
+__DEVICE__ float3 bhs_look_apply(float3 c, bhs_look L)
+{
+    const float PV = 0.336043f;
+    const float ST = 0.07329248f;
+    float r = c.x;
+    float g = c.y;
+    float b = c.z;
+
+    // exposure, in linear light
+    if (L.expo != 0.0f) {
+        float k = _exp2f(L.expo);
+        r = bhs_di_enc(bhs_di_dec(r) * k);
+        g = bhs_di_enc(bhs_di_dec(g) * k);
+        b = bhs_di_enc(bhs_di_dec(b) * k);
+    }
+
+    // overall balance, black stays black
+    float lum = bhs_luma(r, g, b);
+    float bp = bhs_smooth(0.0f, 0.09f, lum);
+    r += L.bal.x * 0.01f * bp;
+    g += L.bal.y * 0.01f * bp;
+    b += L.bal.z * 0.01f * bp;
+
+    // colour: per-hue shifts, saturation with a soft ceiling, density
+    float m = (r + g + b) * 0.3333333f;
+    float a = r - 0.5f * (g + b);
+    float q = 0.8660254f * (g - b);
+    float ch = _sqrtf(a * a + q * q);
+    if (ch > 1.0e-6f) {
+        float h = _atan2f(q, a) * 57.2957795f;
+        if (h < 0.0f) h += 360.0f;
+        float3 v = bhs_vec8(h, L.vR, L.vO, L.vY, L.vG, L.vC, L.vB, L.vP, L.vM);
+        lum = bhs_luma(r, g, b);
+        float wS = 1.0f - bhs_smooth(0.10f, 0.34f, lum);
+        float wH = bhs_smooth(0.42f, 0.70f, lum);
+        float s = L.sat * (1.0f + v.y) * (1.0f + (L.loSat - 1.0f) * wS) * (1.0f + (L.hiSat - 1.0f) * wH);
+        s = _fmaxf(s, 0.0f);
+        float u = ch * s / L.cmax;
+        float gain = s / _sqrtf(_sqrtf(1.0f + u * u * u * u));
+        float rad = v.x * 0.01745329f;
+        float cs = _cosf(rad);
+        float sn = _sinf(rad);
+        float ar = a * cs - q * sn;
+        float qr = a * sn + q * cs;
+        // hue moved only
+        float r1 = m + 0.6666667f * ar;
+        float g1 = m - 0.3333333f * ar + 0.5773503f * qr;
+        float b1 = m - 0.3333333f * ar - 0.5773503f * qr;
+        // hue moved and saturation changed
+        float r2 = m + 0.6666667f * ar * gain;
+        float g2 = m + (-0.3333333f * ar + 0.5773503f * qr) * gain;
+        float b2 = m + (-0.3333333f * ar - 0.5773503f * qr) * gain;
+        float mx1 = _fmaxf(r1, _fmaxf(g1, b1));
+        float mx2 = _fmaxf(r2, _fmaxf(g2, b2));
+        float cw = 1.0f - _expf(-ch * 5.0f);
+        // density per color, film-style saturation (deeper, not brighter), and a brightness hold for hue moves
+        float d = (v.z - L.dens) * ST * cw - 0.6f * _fmaxf(mx2 - mx1, 0.0f) + 0.30f * (lum - bhs_luma(r1, g1, b1));
+        r = r2 + d;
+        g = g2 + d;
+        b = b2 + d;
+    }
+
+    // black and white, done before tone and tint so toned monochrome looks work
+    if (L.mono > 0.0f) {
+        float lm = bhs_luma(r, g, b);
+        r += (lm - r) * L.mono;
+        g += (lm - g) * L.mono;
+        b += (lm - b) * L.mono;
+    }
+
+    // tone: film curve per channel, slightly different per channel for crossover
+    r = bhs_tone(r, PV, L.con * L.gam.x, L.toe, L.sho);
+    g = bhs_tone(g, PV, L.con * L.gam.y, L.toe, L.sho);
+    b = bhs_tone(b, PV, L.con * L.gam.z, L.toe, L.sho);
+
+    // tinted shadows and highlights
+    lum = bhs_luma(r, g, b);
+    float tS = (1.0f - bhs_smooth(0.08f, 0.36f, lum)) * bhs_smooth(0.0f, 0.07f, lum);
+    float tH = bhs_smooth(0.34f, 0.62f, lum);
+    r += (L.shT.x * tS + L.hiT.x * tH) * 0.01f;
+    g += (L.shT.y * tS + L.hiT.y * tH) * 0.01f;
+    b += (L.shT.z * tS + L.hiT.z * tH) * 0.01f;
+
+    // faded, tinted blacks
+    if (L.fade != 0.0f) {
+        float fr = _clampf(1.0f - r / PV, 0.0f, 1.2f);
+        float fg = _clampf(1.0f - g / PV, 0.0f, 1.2f);
+        float fb = _clampf(1.0f - b / PV, 0.0f, 1.2f);
+        r += (L.fade + L.fadeT.x) * 0.01f * fr * fr;
+        g += (L.fade + L.fadeT.y) * 0.01f * fg * fg;
+        b += (L.fade + L.fadeT.z) * 0.01f * fb * fb;
+    }
+    return bhs_floor(make_float3(r, g, b), c);
+}
+
+__DEVICE__ bhs_look bhs_get_look(int id)
+{
+    bhs_look L = bhs_look_init();
+    if (id == 0) {   // Danfo Teal
+        L.con = 1.16f; L.toe = 0.7f; L.sho = 0.45f; L.sat = 1.06f; L.cmax = 0.92f; L.dens = 0.18f; L.gam = make_float3(1.015f, 1.0f, 0.975f);
+        L.bal = make_float3(0.3f, 0.3f, -0.6f); L.shT = make_float3(-0.5f, 0.4f, 0.2f); L.hiT = make_float3(0.9f, 0.7f, -1.5f);
+        L.vR = make_float3(-3.0f, 0.04f, -0.14f); L.vO = make_float3(1.0f, 0.08f, -0.04f); L.vY = make_float3(-6.0f, 0.12f, -0.04f);
+        L.vG = make_float3(14.0f, -0.1f, -0.14f); L.vC = make_float3(-4.0f, 0.16f, -0.3f); L.vB = make_float3(-52.0f, 0.22f, -0.55f);
+        L.vP = make_float3(-40.0f, -0.1f, -0.2f); L.vM = make_float3(4.0f, -0.1f, 0.0f);
+    }
+    else if (id == 1) {   // Danfo Teal Soft
+        L.con = 1.08f; L.toe = 0.85f; L.sho = 0.5f; L.fade = 0.6f; L.sat = 1.0f; L.cmax = 0.88f; L.dens = 0.12f;
+        L.gam = make_float3(1.01f, 1.0f, 0.98f); L.bal = make_float3(0.2f, 0.2f, -0.4f); L.shT = make_float3(-0.3f, 0.3f, 0.1f);
+        L.hiT = make_float3(0.7f, 0.5f, -1.1f); L.vR = make_float3(-2.0f, 0.02f, -0.08f); L.vO = make_float3(1.0f, 0.06f, 0.0f);
+        L.vY = make_float3(-4.0f, 0.08f, 0.0f); L.vG = make_float3(10.0f, -0.1f, -0.08f); L.vC = make_float3(-3.0f, 0.1f, -0.16f);
+        L.vB = make_float3(-40.0f, 0.12f, -0.3f); L.vP = make_float3(-28.0f, -0.1f, -0.1f); L.vM = make_float3(2.0f, -0.08f, 0.0f);
+    }
+    else if (id == 2) {   // Market Dusk
+        L.con = 1.18f; L.toe = 0.8f; L.sho = 0.5f; L.expo = -0.55f; L.sat = 1.02f; L.cmax = 0.88f; L.dens = 0.26f;
+        L.gam = make_float3(1.02f, 1.005f, 0.965f); L.bal = make_float3(0.6f, 0.3f, -0.9f); L.shT = make_float3(0.1f, 0.5f, -0.5f);
+        L.hiT = make_float3(1.0f, 0.6f, -1.4f); L.hiSat = 0.8f; L.vR = make_float3(6.0f, 0.1f, -0.14f); L.vO = make_float3(1.0f, 0.08f, -0.04f);
+        L.vY = make_float3(-6.0f, 0.0f, -0.06f); L.vG = make_float3(-10.0f, -0.3f, -0.14f); L.vC = make_float3(-12.0f, -0.2f, -0.06f);
+        L.vB = make_float3(-20.0f, -0.3f, -0.1f); L.vP = make_float3(-6.0f, -0.3f, 0.0f); L.vM = make_float3(6.0f, -0.1f, 0.0f);
+    }
+    else if (id == 3) {   // Market Dusk Lifted
+        L.con = 1.08f; L.toe = 0.9f; L.sho = 0.5f; L.expo = -0.1f; L.fade = 1.2f; L.fadeT = make_float3(0.1f, 0.3f, -0.3f); L.sat = 0.96f;
+        L.cmax = 0.84f; L.dens = 0.16f; L.gam = make_float3(1.015f, 1.004f, 0.972f); L.bal = make_float3(0.5f, 0.25f, -0.7f);
+        L.shT = make_float3(0.1f, 0.3f, -0.4f); L.hiT = make_float3(0.8f, 0.5f, -1.1f); L.hiSat = 0.8f; L.vR = make_float3(5.0f, 0.06f, -0.1f);
+        L.vO = make_float3(1.0f, 0.06f, -0.02f); L.vY = make_float3(-5.0f, 0.0f, -0.04f); L.vG = make_float3(-8.0f, -0.24f, -0.1f);
+        L.vC = make_float3(-10.0f, -0.16f, -0.04f); L.vB = make_float3(-16.0f, -0.24f, -0.08f); L.vP = make_float3(-4.0f, -0.24f, 0.0f);
+        L.vM = make_float3(4.0f, -0.08f, 0.0f);
+    }
+    else if (id == 4) {   // Earth Walk
+        L.con = 1.04f; L.toe = 0.95f; L.sho = 0.5f; L.fade = 1.5f; L.fadeT = make_float3(-0.2f, 0.3f, 0.1f); L.sat = 0.88f; L.cmax = 0.8f;
+        L.dens = 0.14f; L.gam = make_float3(1.01f, 1.0f, 0.985f); L.bal = make_float3(0.3f, 0.1f, -0.4f); L.shT = make_float3(-0.6f, 0.5f, 0.3f);
+        L.hiT = make_float3(0.6f, 0.4f, -0.8f); L.hiSat = 0.85f; L.vR = make_float3(8.0f, 0.02f, -0.1f); L.vO = make_float3(2.0f, 0.08f, 0.0f);
+        L.vY = make_float3(-8.0f, 0.02f, -0.04f); L.vG = make_float3(8.0f, -0.34f, -0.14f); L.vC = make_float3(-8.0f, -0.2f, -0.08f);
+        L.vB = make_float3(-22.0f, -0.1f, -0.14f); L.vP = make_float3(-10.0f, -0.3f, 0.0f); L.vM = make_float3(6.0f, -0.2f, 0.0f);
+    }
+    else if (id == 5) {   // Rust and Olive
+        L.con = 1.1f; L.toe = 0.85f; L.sho = 0.5f; L.fade = 0.8f; L.fadeT = make_float3(0.0f, 0.2f, -0.2f); L.sat = 0.94f; L.cmax = 0.84f;
+        L.dens = 0.18f; L.gam = make_float3(1.015f, 1.003f, 0.975f); L.bal = make_float3(0.5f, 0.2f, -0.7f); L.shT = make_float3(-0.2f, 0.5f, -0.2f);
+        L.hiT = make_float3(0.8f, 0.5f, -1.2f); L.hiSat = 0.82f; L.vR = make_float3(8.0f, 0.06f, -0.12f); L.vO = make_float3(2.0f, 0.08f, -0.02f);
+        L.vY = make_float3(-8.0f, 0.0f, -0.06f); L.vG = make_float3(-14.0f, -0.26f, -0.14f); L.vC = make_float3(-10.0f, -0.24f, -0.06f);
+        L.vB = make_float3(-18.0f, -0.2f, -0.12f); L.vP = make_float3(-8.0f, -0.3f, 0.0f); L.vM = make_float3(8.0f, -0.14f, 0.0f);
+    }
+    else if (id == 6) {   // Backyard Gold
+        L.con = 1.12f; L.toe = 0.75f; L.sho = 0.45f; L.fade = 0.8f; L.fadeT = make_float3(-0.1f, 0.3f, -0.1f); L.sat = 1.08f; L.cmax = 0.96f;
+        L.dens = 0.1f; L.gam = make_float3(1.0f, 1.015f, 0.955f); L.bal = make_float3(0.4f, 0.6f, -1.0f); L.shT = make_float3(-0.5f, 0.6f, -0.1f);
+        L.hiT = make_float3(0.7f, 0.9f, -1.6f); L.vR = make_float3(5.0f, 0.16f, -0.06f); L.vO = make_float3(3.0f, 0.06f, 0.0f);
+        L.vY = make_float3(2.0f, 0.08f, 0.0f); L.vG = make_float3(-14.0f, 0.1f, -0.06f); L.vC = make_float3(-22.0f, -0.1f, 0.04f);
+        L.vB = make_float3(-34.0f, -0.16f, 0.06f); L.vP = make_float3(-20.0f, -0.2f, 0.0f); L.vM = make_float3(6.0f, 0.0f, 0.0f);
+    }
+    else if (id == 7) {   // Aqua Sky Vintage
+        L.con = 1.04f; L.toe = 0.9f; L.sho = 0.5f; L.fade = 1.4f; L.fadeT = make_float3(-0.1f, 0.3f, 0.0f); L.expo = 0.08f; L.sat = 0.98f;
+        L.cmax = 0.84f; L.dens = 0.06f; L.gam = make_float3(1.0f, 1.01f, 0.965f); L.bal = make_float3(0.3f, 0.4f, -0.7f);
+        L.shT = make_float3(-0.4f, 0.5f, 0.0f); L.hiT = make_float3(0.6f, 0.7f, -1.2f); L.hiSat = 0.85f; L.vR = make_float3(4.0f, 0.1f, -0.04f);
+        L.vO = make_float3(2.0f, 0.04f, 0.02f); L.vY = make_float3(2.0f, 0.04f, 0.0f); L.vG = make_float3(-10.0f, 0.02f, -0.04f);
+        L.vC = make_float3(-18.0f, -0.1f, 0.06f); L.vB = make_float3(-28.0f, -0.14f, 0.08f); L.vP = make_float3(-16.0f, -0.2f, 0.0f);
+        L.vM = make_float3(4.0f, 0.0f, 0.0f);
+    }
+    else if (id == 8) {   // Rich Skin
+        L.con = 1.08f; L.toe = 0.85f; L.sho = 0.45f; L.sat = 1.02f; L.cmax = 0.92f; L.dens = 0.12f; L.gam = make_float3(1.012f, 1.0f, 0.985f);
+        L.bal = make_float3(0.3f, 0.1f, -0.4f); L.shT = make_float3(-0.2f, 0.2f, 0.1f); L.hiT = make_float3(0.7f, 0.45f, -1.0f); L.hiSat = 0.85f;
+        L.vR = make_float3(5.0f, -0.02f, -0.06f); L.vO = make_float3(1.0f, 0.12f, 0.06f); L.vY = make_float3(-4.0f, 0.02f, 0.0f);
+        L.vG = make_float3(-6.0f, -0.1f, -0.1f); L.vC = make_float3(-8.0f, 0.0f, -0.08f); L.vB = make_float3(-12.0f, 0.0f, -0.1f);
+        L.vP = make_float3(-6.0f, -0.1f, 0.0f); L.vM = make_float3(4.0f, -0.08f, 0.0f);
+    }
+    return L;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float3 nat = bhs_in(make_float3(p_R, p_G, p_B), ws);
+    float3 src = bhs_pos(nat);
+
+    bhs_look L = bhs_look_scale(bhs_get_look(look), toneAmt * strength, colAmt * strength);
+    L.expo += expo;
+    L.con *= con;
+    L.sat *= sat;
+    L.dens += dens;
+    L.bal.x += warm * 2.5f + tint * 1.0f;
+    L.bal.y += warm * 0.4f - tint * 1.8f;
+    L.bal.z += -warm * 3.0f + tint * 1.0f;
+    L.fade += fade * 4.0f;
+    float3 res = bhs_look_apply(src, L);
+
+    if (skinKeep > 0.0f) {
+        float w = bhs_skin(src.x, src.y, src.z) * skinKeep;
+        if (w > 0.0f) {
+            bhs_look T = bhs_look_scale(bhs_get_look(look), toneAmt * strength, 0.0f);
+            T.expo += expo;
+            T.con *= con;
+            T.fade += fade * 4.0f;
+            float3 t = bhs_look_apply(src, T);
+            res.x += (t.x - res.x) * w;
+            res.y += (t.y - res.y) * w;
+            res.z += (t.z - res.z) * w;
+        }
+    }
+    float3 fin = bhs_out(res, nat, ws);
+    return make_float3(fin.x, fin.y, fin.z);
+}

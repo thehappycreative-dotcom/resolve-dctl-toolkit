@@ -14,6 +14,21 @@ Free, open-source DCTLs for DaVinci Resolve by **Behappystudiox** (BHS), made fo
 | **BHS Skin Vibrance** | `dctl/color` | Boosts dull colors, leaves skin tones alone. |
 | **BHS Vignette** | `dctl/effects` | Darken or lighten edges, with highlight protection. |
 
+## BHS Pro pack (25 tools)
+
+A full film-style toolset built on one shared color engine, in `dctl/pro`. Full documentation: **[docs/BHS_Pro_Guide.md](docs/BHS_Pro_Guide.md)**.
+
+| Group | Tools |
+|---|---|
+| **Film** | A1 Film Lab (17 negative stocks x 6 print stocks), A2 Mono Film |
+| **Looks** | B1 Looks (20 finished looks), B2 Inspo Looks, B3 Clean Lifestyle |
+| **Density & color** | C1 Density, C2 Subtractive Saturation, C3 Color Separation, C4 Crosstalk |
+| **Color tools** | D1 Vectors HSL, D2 Tetra, D3 Split Tone, D4 Skin Refine, D5 Film Curve, D6 Exposure and Balance |
+| **Texture** | E1 Grain, E2 Halation, E3 Bloom and Mist, E4 Vignette |
+| **Utility** | U1 False Color, U2 Scope Views, U3 Test Chart, U4 Gamut Compress, U5 Camera Input (14 camera log formats), U6 Display Output |
+
+> Film stock and camera names are used only to describe the look and input format. This project is not affiliated with or endorsed by any film or camera manufacturer. Stock looks are tuned by eye, not measured from film scans.
+
 ## Previews
 
 Rendered on a synthetic test scene (left = input, right = result). Settings used are in the DCTL defaults unless noted.

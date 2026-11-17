@@ -1,0 +1,265 @@
+// BHS Pro - Tetra
+// Six-vector tetrahedral color control, the colorist favourite. Each of the six pure colors
+// (red, yellow, green, cyan, blue, magenta) has an R, G and B target. Move a target and that
+// color shifts, with everything in between following smoothly. Black, white and all grays
+// are fixed, so it can never tint the neutral axis.
+// Example: lower Blue R and raise Blue G to push blues toward teal.
+
+DEFINE_UI_PARAMS(ws, Working Space, DCTLUI_COMBO_BOX, 0, { WS_709, WS_DWG, WS_ACES }, { Rec.709 Gamma 2.4, DaVinci WG Intermediate, ACEScct })
+DEFINE_UI_TOOLTIP(Working Space, "What this node is being fed. Use Rec.709 after your conversion to Rec.709 or DaVinci WG Intermediate in a wide gamut timeline.")
+DEFINE_UI_PARAMS(amount, Amount, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(redR, Red R, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_PARAMS(redG, Red G, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(redB, Red B, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(yelR, Yellow R, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_PARAMS(yelG, Yellow G, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_PARAMS(yelB, Yellow B, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(grnR, Green R, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(grnG, Green G, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_PARAMS(grnB, Green B, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(cynR, Cyan R, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(cynG, Cyan G, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_PARAMS(cynB, Cyan B, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_PARAMS(bluR, Blue R, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(bluG, Blue G, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(bluB, Blue B, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_PARAMS(magR, Magenta R, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_PARAMS(magG, Magenta G, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(magB, Magenta B, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.005)
+DEFINE_UI_TOOLTIP(Amount, "Blend between the original and the adjusted color.")
+DEFINE_UI_TOOLTIP(Blue G, "Raise to push blues toward teal.")
+DEFINE_UI_TOOLTIP(Green R, "Raise to push greens toward yellow and olive.")
+DEFINE_UI_TOOLTIP(Red G, "Raise to push reds toward orange.")
+
+// ---------------------------------------------------------------------------
+// BHS Pro color core
+// Every BHS Pro tool does its maths in one internal space: a film-style log
+// encoding (the DaVinci Intermediate curve) on Rec.709 primaries. Working in
+// log on display primaries is how film-print grading behaves: colors get denser
+// instead of neon, and results stay inside the Rec.709 range by construction.
+// "Working Space" tells the tool what it is being fed; it converts in, does the
+// work, and hands back the same space. With every control at neutral the
+// picture passes through unchanged.
+// ---------------------------------------------------------------------------
+
+__DEVICE__ float bhs_smooth(float e0, float e1, float x)
+{
+    float t = _clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// DaVinci Intermediate log curve
+__DEVICE__ float bhs_di_enc(float v)
+{
+    return v > 0.00262409f ? (_log2f(v + 0.0075f) + 7.0f) * 0.07329248f : v * 10.44426855f;
+}
+
+__DEVICE__ float bhs_di_dec(float v)
+{
+    return v > 0.02740668f ? _exp2f(v / 0.07329248f - 7.0f) - 0.0075f : v / 10.44426855f;
+}
+
+// ACEScct log curve
+__DEVICE__ float bhs_cct_enc(float v)
+{
+    return v > 0.0078125f ? (_log2f(v) + 9.72f) / 17.52f : 10.5402377416545f * v + 0.0729055341958355f;
+}
+
+__DEVICE__ float bhs_cct_dec(float v)
+{
+    return v > 0.155251141552511f ? _exp2f(v * 17.52f - 9.72f) : (v - 0.0729055341958355f) / 10.5402377416545f;
+}
+
+// Display gamma 2.4, mirrored for values below zero
+__DEVICE__ float bhs_g24_dec(float v)
+{
+    return v < 0.0f ? -_powf(-v, 2.4f) : _powf(v, 2.4f);
+}
+
+__DEVICE__ float bhs_g24_enc(float v)
+{
+    return v < 0.0f ? -_powf(-v, 0.4166667f) : _powf(v, 0.4166667f);
+}
+
+// Display light <-> estimated scene light. A soft, exactly invertible highlight
+// rolloff, so exposure and contrast moves made on a Rec.709 image roll off
+// gently instead of clipping. Display 0.12 (about 41 IRE) maps to scene 0.18.
+__DEVICE__ float bhs_unroll(float y)
+{
+    if (y <= 0.0f) return y * 1.3333333f;
+    if (y >= 1.0f) return 28.0f + (y - 1.0f) * 588.0f;
+    return 1.4f * y / (1.05f - y);
+}
+
+__DEVICE__ float bhs_roll(float x)
+{
+    if (x <= 0.0f) return x * 0.75f;
+    if (x >= 28.0f) return 1.0f + (x - 28.0f) / 588.0f;
+    return 1.05f * x / (x + 1.4f);
+}
+
+// Working space -> internal.  ws: 0 = Rec.709 Gamma 2.4, 1 = DaVinci WG / Intermediate, 2 = ACEScct
+__DEVICE__ float3 bhs_in(float3 c, int ws)
+{
+    float r, g, b;
+    if (ws == 0) {
+        r = bhs_unroll(bhs_g24_dec(c.x));
+        g = bhs_unroll(bhs_g24_dec(c.y));
+        b = bhs_unroll(bhs_g24_dec(c.z));
+    } else if (ws == 1) {
+        float lr = bhs_di_dec(c.x);
+        float lg = bhs_di_dec(c.y);
+        float lb = bhs_di_dec(c.z);
+        r =  1.89861490f * lr - 0.79217618f * lg - 0.10643872f * lb;
+        g = -0.16894879f * lr + 1.48897575f * lg - 0.32002697f * lb;
+        b = -0.12153916f * lr - 0.31567585f * lg + 1.43721501f * lb;
+    } else {
+        float lr = bhs_cct_dec(c.x);
+        float lg = bhs_cct_dec(c.y);
+        float lb = bhs_cct_dec(c.z);
+        r =  1.70505099f * lr - 0.62179212f * lg - 0.08325887f * lb;
+        g = -0.13025642f * lr + 1.14080474f * lg - 0.01054832f * lb;
+        b = -0.02400336f * lr - 0.12896898f * lg + 1.15297233f * lb;
+    }
+    return make_float3(bhs_di_enc(r), bhs_di_enc(g), bhs_di_enc(b));
+}
+
+// The part of an internal color the tools work on. Anything below zero (colors
+// outside Rec.709 in a wide gamut grade) is set aside and added back untouched
+// by bhs_out, so nothing is lost and the tools never see invalid values.
+__DEVICE__ float3 bhs_pos(float3 c)
+{
+    return make_float3(_fmaxf(c.x, 0.0f), _fmaxf(c.y, 0.0f), _fmaxf(c.z, 0.0f));
+}
+
+// Internal -> working space. res: processed color. orig: what bhs_in returned.
+__DEVICE__ float3 bhs_out(float3 res, float3 orig, int ws)
+{
+    float r = bhs_di_dec(res.x + _fminf(orig.x, 0.0f));
+    float g = bhs_di_dec(res.y + _fminf(orig.y, 0.0f));
+    float b = bhs_di_dec(res.z + _fminf(orig.z, 0.0f));
+    if (ws == 0) {
+        return make_float3(bhs_g24_enc(bhs_roll(r)), bhs_g24_enc(bhs_roll(g)), bhs_g24_enc(bhs_roll(b)));
+    }
+    if (ws == 1) {
+        float lr = 0.56276746f * r + 0.32351659f * g + 0.11371596f * b;
+        float lg = 0.07775464f * r + 0.74957735f * g + 0.17266802f * b;
+        float lb = 0.06466920f * r + 0.19199869f * g + 0.74333211f * b;
+        return make_float3(bhs_di_enc(lr), bhs_di_enc(lg), bhs_di_enc(lb));
+    }
+    float ar = 0.61309740f * r + 0.33952315f * g + 0.04737945f * b;
+    float ag = 0.07019372f * r + 0.91635388f * g + 0.01345240f * b;
+    float ab = 0.02061559f * r + 0.10956977f * g + 0.86981463f * b;
+    return make_float3(bhs_cct_enc(ar), bhs_cct_enc(ag), bhs_cct_enc(ab));
+}
+
+// Brightness of an internal (log) color.  Mid gray = 0.336, one stop = 0.0733
+__DEVICE__ float bhs_luma(float r, float g, float b)
+{
+    return 0.24f * r + 0.68f * g + 0.08f * b;
+}
+
+// Hue angle in degrees and colorfulness of an internal color.
+// 0 red, 20 skin, 30 orange, 50 yellow, 90 foliage, 125 green, 180 teal and cyan,
+// 215 sky, 235 blue, 270 purple, 310 magenta, 340 pink.
+__DEVICE__ float bhs_hue(float r, float g, float b)
+{
+    float a = r - 0.5f * (g + b);
+    float q = 0.8660254f * (g - b);
+    if (_fabs(a) + _fabs(q) < 1.0e-7f) return 0.0f;
+    float h = _atan2f(q, a) * 57.2957795f;
+    return h < 0.0f ? h + 360.0f : h;
+}
+
+__DEVICE__ float bhs_chroma(float r, float g, float b)
+{
+    float a = r - 0.5f * (g + b);
+    float q = 0.8660254f * (g - b);
+    return _sqrtf(a * a + q * q);
+}
+
+// Shortest distance between two hue angles, in degrees
+__DEVICE__ float bhs_hue_dist(float h1, float h2)
+{
+    float d = _fabs(h1 - h2);
+    return d > 180.0f ? 360.0f - d : d;
+}
+
+// How strongly a pixel counts as skin, 0..1 (hue near 20 degrees, moderate colorfulness)
+__DEVICE__ float bhs_skin(float r, float g, float b)
+{
+    float h = bhs_hue(r, g, b);
+    float ch = bhs_chroma(r, g, b);
+    return (1.0f - bhs_smooth(11.0f, 30.0f, bhs_hue_dist(h, 20.0f))) * bhs_smooth(0.03f, 0.09f, ch) * (1.0f - bhs_smooth(0.34f, 0.48f, ch));
+}
+
+// Rotate hue, scale saturation and shift brightness of an internal color.
+// hueDeg: degrees. satGain: multiplier. lumStops: stops, weighted by how colorful
+// the pixel is so grays never move. sub: 0 = plain saturation, 1 = film-style
+// (added saturation makes color deeper, not brighter).
+__DEVICE__ float3 bhs_hsl(float3 c, float hueDeg, float satGain, float lumStops, float sub)
+{
+    float m = (c.x + c.y + c.z) * 0.3333333f;
+    float a = c.x - 0.5f * (c.y + c.z);
+    float q = 0.8660254f * (c.y - c.z);
+    float ch = _sqrtf(a * a + q * q);
+    float rad = hueDeg * 0.01745329f;
+    float cs = _cosf(rad);
+    float sn = _sinf(rad);
+    float ar = a * cs - q * sn;
+    float qr = a * sn + q * cs;
+    float mxr = m + _fmaxf(0.6666667f * ar, _fmaxf(-0.3333333f * ar + 0.5773503f * qr, -0.3333333f * ar - 0.5773503f * qr));
+    float a2 = ar * satGain;
+    float q2 = qr * satGain;
+    float r = m + 0.6666667f * a2;
+    float g = m - 0.3333333f * a2 + 0.5773503f * q2;
+    float b = m - 0.3333333f * a2 - 0.5773503f * q2;
+    float mx2 = _fmaxf(r, _fmaxf(g, b));
+    float cw = 1.0f - _expf(-ch * 5.0f);
+    float d = lumStops * 0.07329248f * cw - sub * _fmaxf(mx2 - mxr, 0.0f) + 0.30f * (bhs_luma(c.x, c.y, c.z) - bhs_luma(m + 0.6666667f * ar, m - 0.3333333f * ar + 0.5773503f * qr, m - 0.3333333f * ar - 0.5773503f * qr));
+    return make_float3(r + d, g + d, b + d);
+}
+
+// Keep a processed channel from dropping below black when the source was not
+__DEVICE__ float3 bhs_floor(float3 res, float3 src)
+{
+    return make_float3((src.x >= 0.0f && res.x < 0.0f) ? 0.0f : res.x, (src.y >= 0.0f && res.y < 0.0f) ? 0.0f : res.y, (src.z >= 0.0f && res.z < 0.0f) ? 0.0f : res.z);
+}
+
+__DEVICE__ float3 bhs_tetra(float3 c, float3 red, float3 yel, float3 grn, float3 cyn, float3 blu, float3 mag)
+{
+    float r = c.x;
+    float g = c.y;
+    float b = c.z;
+    float3 w = make_float3(1.0f, 1.0f, 1.0f);
+    float3 p1;
+    float3 p2;
+    float k1;
+    float k2;
+    float k3;
+    if (r > g) {
+        if (g > b)      { p1 = red; p2 = yel; k1 = r; k2 = g; k3 = b; }
+        else if (r > b) { p1 = red; p2 = mag; k1 = r; k2 = b; k3 = g; }
+        else            { p1 = blu; p2 = mag; k1 = b; k2 = r; k3 = g; }
+    } else {
+        if (b > g)      { p1 = blu; p2 = cyn; k1 = b; k2 = g; k3 = r; }
+        else if (b > r) { p1 = grn; p2 = cyn; k1 = g; k2 = b; k3 = r; }
+        else            { p1 = grn; p2 = yel; k1 = g; k2 = r; k3 = b; }
+    }
+    // largest * primary + middle * (secondary - primary) + smallest * (white - secondary)
+    return make_float3(k1 * p1.x + k2 * (p2.x - p1.x) + k3 * (w.x - p2.x),
+                       k1 * p1.y + k2 * (p2.y - p1.y) + k3 * (w.y - p2.y),
+                       k1 * p1.z + k2 * (p2.z - p1.z) + k3 * (w.z - p2.z));
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float3 nat = bhs_in(make_float3(p_R, p_G, p_B), ws);
+    float3 src = bhs_pos(nat);
+    float3 t = bhs_tetra(src, make_float3(redR, redG, redB), make_float3(yelR, yelG, yelB), make_float3(grnR, grnG, grnB),
+                              make_float3(cynR, cynG, cynB), make_float3(bluR, bluG, bluB), make_float3(magR, magG, magB));
+    float3 res = make_float3(src.x + (t.x - src.x) * amount, src.y + (t.y - src.y) * amount, src.z + (t.z - src.z) * amount);
+    res = bhs_floor(res, src);
+    float3 fin = bhs_out(res, nat, ws);
+    return make_float3(fin.x, fin.y, fin.z);
+}

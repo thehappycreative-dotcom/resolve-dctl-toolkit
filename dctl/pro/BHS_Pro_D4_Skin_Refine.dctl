@@ -1,0 +1,260 @@
+// BHS Pro - Skin Refine
+// A dedicated skin tone tool. It finds skin by hue, then lets you even it out and enrich it
+// without touching the rest of the frame. Works on every complexion: Shadow Richness is there
+// to keep deeper skin tones warm and full instead of gray in the shadows.
+// Turn on Show Skin Mask to see exactly what is being treated.
+
+DEFINE_UI_PARAMS(ws, Working Space, DCTLUI_COMBO_BOX, 0, { WS_709, WS_DWG, WS_ACES }, { Rec.709 Gamma 2.4, DaVinci WG Intermediate, ACEScct })
+DEFINE_UI_TOOLTIP(Working Space, "What this node is being fed. Use Rec.709 after your conversion to Rec.709 or DaVinci WG Intermediate in a wide gamut timeline.")
+DEFINE_UI_PARAMS(center, Skin Hue Center, DCTLUI_SLIDER_FLOAT, 20.0, 0.0, 60.0, 0.5)
+DEFINE_UI_PARAMS(range, Skin Hue Range, DCTLUI_SLIDER_FLOAT, 16.0, 5.0, 40.0, 0.5)
+DEFINE_UI_PARAMS(unify, Hue Unify, DCTLUI_SLIDER_FLOAT, 0.3, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(hueShift, Hue Shift, DCTLUI_SLIDER_FLOAT, 0.0, -15.0, 15.0, 0.1)
+DEFINE_UI_PARAMS(deRed, Redness Reduce, DCTLUI_SLIDER_FLOAT, 0.2, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(sat, Saturation, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+DEFINE_UI_PARAMS(even, Even Saturation, DCTLUI_SLIDER_FLOAT, 0.2, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(bright, Brightness, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(glow, Glow, DCTLUI_SLIDER_FLOAT, 0.15, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(rich, Shadow Richness, DCTLUI_SLIDER_FLOAT, 0.25, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(showMask, Show Skin Mask, DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_TOOLTIP(Skin Hue Center, "The hue treated as skin. 20 suits most skin. Check with Show Skin Mask.")
+DEFINE_UI_TOOLTIP(Hue Unify, "Pulls uneven skin hues toward one tone.")
+DEFINE_UI_TOOLTIP(Hue Shift, "Negative is rosier and positive is more golden.")
+DEFINE_UI_TOOLTIP(Redness Reduce, "Calms red patches without changing the rest of the skin.")
+DEFINE_UI_TOOLTIP(Even Saturation, "Evens out blotchy saturation across the skin.")
+DEFINE_UI_TOOLTIP(Glow, "A soft lift in the skin midtones.")
+DEFINE_UI_TOOLTIP(Shadow Richness, "Adds warmth and color to skin shadows so deep skin tones stay full.")
+
+// ---------------------------------------------------------------------------
+// BHS Pro color core
+// Every BHS Pro tool does its maths in one internal space: a film-style log
+// encoding (the DaVinci Intermediate curve) on Rec.709 primaries. Working in
+// log on display primaries is how film-print grading behaves: colors get denser
+// instead of neon, and results stay inside the Rec.709 range by construction.
+// "Working Space" tells the tool what it is being fed; it converts in, does the
+// work, and hands back the same space. With every control at neutral the
+// picture passes through unchanged.
+// ---------------------------------------------------------------------------
+
+__DEVICE__ float bhs_smooth(float e0, float e1, float x)
+{
+    float t = _clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// DaVinci Intermediate log curve
+__DEVICE__ float bhs_di_enc(float v)
+{
+    return v > 0.00262409f ? (_log2f(v + 0.0075f) + 7.0f) * 0.07329248f : v * 10.44426855f;
+}
+
+__DEVICE__ float bhs_di_dec(float v)
+{
+    return v > 0.02740668f ? _exp2f(v / 0.07329248f - 7.0f) - 0.0075f : v / 10.44426855f;
+}
+
+// ACEScct log curve
+__DEVICE__ float bhs_cct_enc(float v)
+{
+    return v > 0.0078125f ? (_log2f(v) + 9.72f) / 17.52f : 10.5402377416545f * v + 0.0729055341958355f;
+}
+
+__DEVICE__ float bhs_cct_dec(float v)
+{
+    return v > 0.155251141552511f ? _exp2f(v * 17.52f - 9.72f) : (v - 0.0729055341958355f) / 10.5402377416545f;
+}
+
+// Display gamma 2.4, mirrored for values below zero
+__DEVICE__ float bhs_g24_dec(float v)
+{
+    return v < 0.0f ? -_powf(-v, 2.4f) : _powf(v, 2.4f);
+}
+
+__DEVICE__ float bhs_g24_enc(float v)
+{
+    return v < 0.0f ? -_powf(-v, 0.4166667f) : _powf(v, 0.4166667f);
+}
+
+// Display light <-> estimated scene light. A soft, exactly invertible highlight
+// rolloff, so exposure and contrast moves made on a Rec.709 image roll off
+// gently instead of clipping. Display 0.12 (about 41 IRE) maps to scene 0.18.
+__DEVICE__ float bhs_unroll(float y)
+{
+    if (y <= 0.0f) return y * 1.3333333f;
+    if (y >= 1.0f) return 28.0f + (y - 1.0f) * 588.0f;
+    return 1.4f * y / (1.05f - y);
+}
+
+__DEVICE__ float bhs_roll(float x)
+{
+    if (x <= 0.0f) return x * 0.75f;
+    if (x >= 28.0f) return 1.0f + (x - 28.0f) / 588.0f;
+    return 1.05f * x / (x + 1.4f);
+}
+
+// Working space -> internal.  ws: 0 = Rec.709 Gamma 2.4, 1 = DaVinci WG / Intermediate, 2 = ACEScct
+__DEVICE__ float3 bhs_in(float3 c, int ws)
+{
+    float r, g, b;
+    if (ws == 0) {
+        r = bhs_unroll(bhs_g24_dec(c.x));
+        g = bhs_unroll(bhs_g24_dec(c.y));
+        b = bhs_unroll(bhs_g24_dec(c.z));
+    } else if (ws == 1) {
+        float lr = bhs_di_dec(c.x);
+        float lg = bhs_di_dec(c.y);
+        float lb = bhs_di_dec(c.z);
+        r =  1.89861490f * lr - 0.79217618f * lg - 0.10643872f * lb;
+        g = -0.16894879f * lr + 1.48897575f * lg - 0.32002697f * lb;
+        b = -0.12153916f * lr - 0.31567585f * lg + 1.43721501f * lb;
+    } else {
+        float lr = bhs_cct_dec(c.x);
+        float lg = bhs_cct_dec(c.y);
+        float lb = bhs_cct_dec(c.z);
+        r =  1.70505099f * lr - 0.62179212f * lg - 0.08325887f * lb;
+        g = -0.13025642f * lr + 1.14080474f * lg - 0.01054832f * lb;
+        b = -0.02400336f * lr - 0.12896898f * lg + 1.15297233f * lb;
+    }
+    return make_float3(bhs_di_enc(r), bhs_di_enc(g), bhs_di_enc(b));
+}
+
+// The part of an internal color the tools work on. Anything below zero (colors
+// outside Rec.709 in a wide gamut grade) is set aside and added back untouched
+// by bhs_out, so nothing is lost and the tools never see invalid values.
+__DEVICE__ float3 bhs_pos(float3 c)
+{
+    return make_float3(_fmaxf(c.x, 0.0f), _fmaxf(c.y, 0.0f), _fmaxf(c.z, 0.0f));
+}
+
+// Internal -> working space. res: processed color. orig: what bhs_in returned.
+__DEVICE__ float3 bhs_out(float3 res, float3 orig, int ws)
+{
+    float r = bhs_di_dec(res.x + _fminf(orig.x, 0.0f));
+    float g = bhs_di_dec(res.y + _fminf(orig.y, 0.0f));
+    float b = bhs_di_dec(res.z + _fminf(orig.z, 0.0f));
+    if (ws == 0) {
+        return make_float3(bhs_g24_enc(bhs_roll(r)), bhs_g24_enc(bhs_roll(g)), bhs_g24_enc(bhs_roll(b)));
+    }
+    if (ws == 1) {
+        float lr = 0.56276746f * r + 0.32351659f * g + 0.11371596f * b;
+        float lg = 0.07775464f * r + 0.74957735f * g + 0.17266802f * b;
+        float lb = 0.06466920f * r + 0.19199869f * g + 0.74333211f * b;
+        return make_float3(bhs_di_enc(lr), bhs_di_enc(lg), bhs_di_enc(lb));
+    }
+    float ar = 0.61309740f * r + 0.33952315f * g + 0.04737945f * b;
+    float ag = 0.07019372f * r + 0.91635388f * g + 0.01345240f * b;
+    float ab = 0.02061559f * r + 0.10956977f * g + 0.86981463f * b;
+    return make_float3(bhs_cct_enc(ar), bhs_cct_enc(ag), bhs_cct_enc(ab));
+}
+
+// Brightness of an internal (log) color.  Mid gray = 0.336, one stop = 0.0733
+__DEVICE__ float bhs_luma(float r, float g, float b)
+{
+    return 0.24f * r + 0.68f * g + 0.08f * b;
+}
+
+// Hue angle in degrees and colorfulness of an internal color.
+// 0 red, 20 skin, 30 orange, 50 yellow, 90 foliage, 125 green, 180 teal and cyan,
+// 215 sky, 235 blue, 270 purple, 310 magenta, 340 pink.
+__DEVICE__ float bhs_hue(float r, float g, float b)
+{
+    float a = r - 0.5f * (g + b);
+    float q = 0.8660254f * (g - b);
+    if (_fabs(a) + _fabs(q) < 1.0e-7f) return 0.0f;
+    float h = _atan2f(q, a) * 57.2957795f;
+    return h < 0.0f ? h + 360.0f : h;
+}
+
+__DEVICE__ float bhs_chroma(float r, float g, float b)
+{
+    float a = r - 0.5f * (g + b);
+    float q = 0.8660254f * (g - b);
+    return _sqrtf(a * a + q * q);
+}
+
+// Shortest distance between two hue angles, in degrees
+__DEVICE__ float bhs_hue_dist(float h1, float h2)
+{
+    float d = _fabs(h1 - h2);
+    return d > 180.0f ? 360.0f - d : d;
+}
+
+// How strongly a pixel counts as skin, 0..1 (hue near 20 degrees, moderate colorfulness)
+__DEVICE__ float bhs_skin(float r, float g, float b)
+{
+    float h = bhs_hue(r, g, b);
+    float ch = bhs_chroma(r, g, b);
+    return (1.0f - bhs_smooth(11.0f, 30.0f, bhs_hue_dist(h, 20.0f))) * bhs_smooth(0.03f, 0.09f, ch) * (1.0f - bhs_smooth(0.34f, 0.48f, ch));
+}
+
+// Rotate hue, scale saturation and shift brightness of an internal color.
+// hueDeg: degrees. satGain: multiplier. lumStops: stops, weighted by how colorful
+// the pixel is so grays never move. sub: 0 = plain saturation, 1 = film-style
+// (added saturation makes color deeper, not brighter).
+__DEVICE__ float3 bhs_hsl(float3 c, float hueDeg, float satGain, float lumStops, float sub)
+{
+    float m = (c.x + c.y + c.z) * 0.3333333f;
+    float a = c.x - 0.5f * (c.y + c.z);
+    float q = 0.8660254f * (c.y - c.z);
+    float ch = _sqrtf(a * a + q * q);
+    float rad = hueDeg * 0.01745329f;
+    float cs = _cosf(rad);
+    float sn = _sinf(rad);
+    float ar = a * cs - q * sn;
+    float qr = a * sn + q * cs;
+    float mxr = m + _fmaxf(0.6666667f * ar, _fmaxf(-0.3333333f * ar + 0.5773503f * qr, -0.3333333f * ar - 0.5773503f * qr));
+    float a2 = ar * satGain;
+    float q2 = qr * satGain;
+    float r = m + 0.6666667f * a2;
+    float g = m - 0.3333333f * a2 + 0.5773503f * q2;
+    float b = m - 0.3333333f * a2 - 0.5773503f * q2;
+    float mx2 = _fmaxf(r, _fmaxf(g, b));
+    float cw = 1.0f - _expf(-ch * 5.0f);
+    float d = lumStops * 0.07329248f * cw - sub * _fmaxf(mx2 - mxr, 0.0f) + 0.30f * (bhs_luma(c.x, c.y, c.z) - bhs_luma(m + 0.6666667f * ar, m - 0.3333333f * ar + 0.5773503f * qr, m - 0.3333333f * ar - 0.5773503f * qr));
+    return make_float3(r + d, g + d, b + d);
+}
+
+// Keep a processed channel from dropping below black when the source was not
+__DEVICE__ float3 bhs_floor(float3 res, float3 src)
+{
+    return make_float3((src.x >= 0.0f && res.x < 0.0f) ? 0.0f : res.x, (src.y >= 0.0f && res.y < 0.0f) ? 0.0f : res.y, (src.z >= 0.0f && res.z < 0.0f) ? 0.0f : res.z);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float3 nat = bhs_in(make_float3(p_R, p_G, p_B), ws);
+    float3 src = bhs_pos(nat);
+    float ch = bhs_chroma(src.x, src.y, src.z);
+    float h = bhs_hue(src.x, src.y, src.z);
+    float lum = bhs_luma(src.x, src.y, src.z);
+
+    float dist = bhs_hue_dist(h, center);
+    float w = (1.0f - bhs_smooth(range * 0.6f, range * 1.4f, dist)) * bhs_smooth(0.03f, 0.09f, ch) * (1.0f - bhs_smooth(0.34f, 0.48f, ch));
+
+    if (showMask) {
+        float gy = lum * 0.6f;
+        float3 m = make_float3(gy + (src.x - gy) * w, gy + (src.y - gy) * w, gy + (src.z - gy) * w);
+        float3 fin = bhs_out(m, nat, ws);
+        return make_float3(fin.x, fin.y, fin.z);
+    }
+    if (w <= 0.0f) return make_float3(p_R, p_G, p_B);
+
+    // hue: gather toward the centre, calm the red side, then shift
+    float dh = center - h;
+    if (dh > 180.0f) dh -= 360.0f;
+    if (dh < -180.0f) dh += 360.0f;
+    float shadow = 1.0f - bhs_smooth(0.14f, 0.32f, lum);
+    float shift = unify * dh + deRed * 0.6f * _fmaxf(dh, 0.0f) + hueShift - rich * 2.0f * shadow;
+
+    // saturation: overall, evened out, and richer in the shadows
+    float gain = sat * (1.0f + rich * 0.35f * shadow);
+    if (ch > 1.0e-5f) gain *= (ch + even * 0.5f * (0.17f - ch)) / ch;
+    gain = _fmaxf(gain, 0.0f);
+
+    float3 res = bhs_hsl(src, shift * w, 1.0f + (gain - 1.0f) * w, 0.0f, 0.5f);
+    float lift = bright * 0.07329248f + glow * 0.35f * 0.07329248f * bhs_smooth(0.12f, 0.34f, lum) * (1.0f - bhs_smooth(0.50f, 0.72f, lum));
+    lift *= w;
+    res = bhs_floor(make_float3(res.x + lift, res.y + lift, res.z + lift), src);
+    float3 fin = bhs_out(res, nat, ws);
+    return make_float3(fin.x, fin.y, fin.z);
+}
