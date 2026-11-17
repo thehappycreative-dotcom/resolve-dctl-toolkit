@@ -1,0 +1,50 @@
+// BHS Split Tone
+// Tint the shadows and highlights with two hues. Brightness is preserved so it behaves like color, not exposure.
+
+DEFINE_UI_PARAMS(sh_hue, Shadow Hue, DCTLUI_SLIDER_FLOAT, 215.0, 0.0, 360.0, 1.0)
+DEFINE_UI_PARAMS(sh_sat, Shadow Strength, DCTLUI_SLIDER_FLOAT, 0.25, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(hi_hue, Highlight Hue, DCTLUI_SLIDER_FLOAT, 35.0, 0.0, 360.0, 1.0)
+DEFINE_UI_PARAMS(hi_sat, Highlight Strength, DCTLUI_SLIDER_FLOAT, 0.25, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(balance, Balance, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(softness, Blend Softness, DCTLUI_SLIDER_FLOAT, 0.5, 0.1, 1.0, 0.01)
+DEFINE_UI_PARAMS(keep_luma, Keep Brightness, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.01)
+
+__DEVICE__ float bhs_smooth(float a, float b, float x)
+{
+    float t = _fminf(_fmaxf((x - a) / (b - a), 0.0f), 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float bhs_hue_r(float h) { return _fminf(_fmaxf(_fabs(h * 6.0f - 3.0f) - 1.0f, 0.0f), 1.0f); }
+__DEVICE__ float bhs_hue_g(float h) { return _fminf(_fmaxf(2.0f - _fabs(h * 6.0f - 2.0f), 0.0f), 1.0f); }
+__DEVICE__ float bhs_hue_b(float h) { return _fminf(_fmaxf(2.0f - _fabs(h * 6.0f - 4.0f), 0.0f), 1.0f); }
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float luma = 0.2126f * p_R + 0.7152f * p_G + 0.0722f * p_B;
+
+    float mid = 0.5f + balance * 0.3f;
+    float w = softness * 0.5f;
+    float wHi = bhs_smooth(mid - w, mid + w, luma);
+    float wSh = 1.0f - wHi;
+
+    float shH = sh_hue / 360.0f;
+    float hiH = hi_hue / 360.0f;
+    float sR = bhs_hue_r(shH), sG = bhs_hue_g(shH), sB = bhs_hue_b(shH);
+    float hR = bhs_hue_r(hiH), hG = bhs_hue_g(hiH), hB = bhs_hue_b(hiH);
+    float sL = 0.2126f * sR + 0.7152f * sG + 0.0722f * sB;
+    float hL = 0.2126f * hR + 0.7152f * hG + 0.0722f * hB;
+
+    float fade = bhs_smooth(0.0f, 0.08f, luma);   // keeps pure black at black
+    float aSh = sh_sat * wSh * 0.35f * fade;
+    float aHi = hi_sat * wHi * 0.35f * fade;
+    float r = p_R + (sR - sL) * aSh + (hR - hL) * aHi;
+    float g = p_G + (sG - sL) * aSh + (hG - hL) * aHi;
+    float b = p_B + (sB - sL) * aSh + (hB - hL) * aHi;
+
+    float newL = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    float k = luma / _fmaxf(newL, 0.0001f);
+    float kk = 1.0f + (k - 1.0f) * keep_luma;
+    if (luma < 0.0001f) kk = 1.0f;
+    return make_float3(r * kk, g * kk, b * kk);
+}

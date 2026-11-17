@@ -1,0 +1,36 @@
+// BHS Vignette
+// Darkens (negative Amount) or lightens (positive Amount) the edges. Bright highlights can be protected so lights do not turn grey.
+
+DEFINE_UI_PARAMS(amount, Amount, DCTLUI_SLIDER_FLOAT, -0.5, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(size, Size, DCTLUI_SLIDER_FLOAT, 0.65, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(softness, Softness, DCTLUI_SLIDER_FLOAT, 0.7, 0.05, 1.5, 0.01)
+DEFINE_UI_PARAMS(roundness, Roundness, DCTLUI_SLIDER_FLOAT, 0.5, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(cx, Center X, DCTLUI_SLIDER_FLOAT, 0.5, 0.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(cy, Center Y, DCTLUI_SLIDER_FLOAT, 0.5, 0.0, 1.0, 0.005)
+DEFINE_UI_PARAMS(protect, Highlight Protection, DCTLUI_SLIDER_FLOAT, 0.4, 0.0, 1.0, 0.01)
+
+__DEVICE__ float bhs_smooth(float a, float b, float x)
+{
+    float t = _fminf(_fmaxf((x - a) / (b - a), 0.0f), 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float w = (float)p_Width;
+    float h = (float)p_Height;
+    float aspect = w / h;
+    float nx = ((float)p_X / w - cx) * 2.0f;
+    float ny = ((float)p_Y / h - cy) * 2.0f;
+    // roundness 1 = circle, 0 = ellipse that follows the frame shape
+    nx = nx * (1.0f + (aspect - 1.0f) * roundness) / aspect;
+    float dist = _sqrtf(nx * nx + ny * ny);
+
+    float v = bhs_smooth(size, size + softness, dist);
+    float luma = 0.2126f * p_R + 0.7152f * p_G + 0.0722f * p_B;
+    float prot = protect * bhs_smooth(0.6f, 1.0f, luma);
+
+    float gain = 1.0f + amount * v * (1.0f - prot);
+    if (gain < 0.0f) gain = 0.0f;
+    return make_float3(p_R * gain, p_G * gain, p_B * gain);
+}

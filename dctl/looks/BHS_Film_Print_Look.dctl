@@ -1,0 +1,104 @@
+// BHS Film Print Look
+// Film-style tone curve, dye crosstalk, tinted shadows and highlights, and highlight desaturation.
+// Use on a display-referred (Rec.709 / gamma 2.4) image, or after your color space transform.
+// Five looks: Warm Gold, Cool Green, Soft Portrait, Night Neon, Black and White.
+
+DEFINE_UI_PARAMS(look, Film Look, DCTLUI_COMBO_BOX, 0, { LOOK_GOLD, LOOK_GREEN, LOOK_PORTRAIT, LOOK_NIGHT, LOOK_BW }, { Warm Gold, Cool Green, Soft Portrait, Night Neon, Black and White })
+DEFINE_UI_PARAMS(strength, Look Strength, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(contrast, Contrast, DCTLUI_SLIDER_FLOAT, 1.15, 0.6, 2.0, 0.01)
+DEFINE_UI_PARAMS(pivot, Contrast Pivot, DCTLUI_SLIDER_FLOAT, 0.40, 0.15, 0.65, 0.005)
+DEFINE_UI_PARAMS(toe, Shadow Toe Lift, DCTLUI_SLIDER_FLOAT, 0.30, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(shoulder, Highlight Shoulder, DCTLUI_SLIDER_FLOAT, 0.40, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(saturation, Saturation, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+DEFINE_UI_PARAMS(crosstalk, Dye Crosstalk, DCTLUI_SLIDER_FLOAT, 0.06, 0.0, 0.25, 0.005)
+DEFINE_UI_PARAMS(hl_desat, Highlight Desaturation, DCTLUI_SLIDER_FLOAT, 0.30, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(tint_amount, Tint Amount, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+
+__DEVICE__ float bhs_smooth(float a, float b, float x)
+{
+    float t = _fminf(_fmaxf((x - a) / (b - a), 0.0f), 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float bhs_curve(float x, float c, float p, float toeAmt, float shoAmt)
+{
+    float over = _fmaxf(x - 1.0f, 0.0f);
+    float v = _fminf(_fmaxf(x, 0.0f), 1.0f);
+    float y;
+    if (v < p)
+        y = p * _powf(v / p, c);
+    else
+        y = 1.0f - (1.0f - p) * _powf((1.0f - v) / (1.0f - p), c);
+    float inv = 1.0f - y;
+    y = y + toeAmt * 0.05f * inv * inv * inv * inv;
+    y = y - shoAmt * 0.07f * y * y * y * y;
+    return y + over;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float srcR = p_R;
+    float srcG = p_G;
+    float srcB = p_B;
+
+    // per-look settings: shadow tint, highlight tint (RGB offsets), saturation scale, contrast scale
+    float shR = 0.0f, shG = 0.0f, shB = 0.0f;
+    float hiR = 0.0f, hiG = 0.0f, hiB = 0.0f;
+    float satScale = 1.0f;
+    float conScale = 1.0f;
+    if (look == 0) {            // Warm Gold
+        shR = -0.010f; shG = 0.004f; shB = 0.018f;
+        hiR = 0.030f;  hiG = 0.012f; hiB = -0.026f;
+        satScale = 1.05f; conScale = 1.00f;
+    } else if (look == 1) {     // Cool Green
+        shR = -0.012f; shG = 0.014f; shB = 0.010f;
+        hiR = 0.004f;  hiG = 0.018f; hiB = -0.010f;
+        satScale = 0.95f; conScale = 1.05f;
+    } else if (look == 2) {     // Soft Portrait
+        shR = 0.004f;  shG = 0.000f; shB = 0.010f;
+        hiR = 0.020f;  hiG = 0.008f; hiB = -0.008f;
+        satScale = 0.90f; conScale = 0.90f;
+    } else if (look == 3) {     // Night Neon
+        shR = -0.012f; shG = 0.006f; shB = 0.030f;
+        hiR = 0.026f;  hiG = -0.006f; hiB = 0.016f;
+        satScale = 1.15f; conScale = 1.10f;
+    }
+
+    // dye crosstalk: each channel picks up a little of the others (rows sum to 1)
+    float ct = crosstalk;
+    float r = srcR * (1.0f - 2.0f * ct) + (srcG + srcB) * ct;
+    float g = srcG * (1.0f - 2.0f * ct) + (srcR + srcB) * ct;
+    float b = srcB * (1.0f - 2.0f * ct) + (srcR + srcG) * ct;
+
+    // film tone curve per channel
+    float c = contrast * conScale;
+    r = bhs_curve(r, c, pivot, toe, shoulder);
+    g = bhs_curve(g, c, pivot, toe, shoulder);
+    b = bhs_curve(b, c, pivot, toe, shoulder);
+
+    float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+
+    // tint shadows and highlights
+    float wSh = 1.0f - bhs_smooth(0.0f, 0.5f, luma);
+    float wHi = bhs_smooth(0.45f, 1.0f, luma);
+    r = r + (shR * wSh + hiR * wHi) * tint_amount;
+    g = g + (shG * wSh + hiG * wHi) * tint_amount;
+    b = b + (shB * wSh + hiB * wHi) * tint_amount;
+
+    // saturation with highlight rolloff
+    float s = saturation * satScale * (1.0f - hl_desat * wHi);
+    float l2 = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    r = l2 + (r - l2) * s;
+    g = l2 + (g - l2) * s;
+    b = l2 + (b - l2) * s;
+
+    if (look == 4) {            // Black and White
+        r = l2; g = l2; b = l2;
+    }
+
+    // blend with the original
+    float outR = srcR + (r - srcR) * strength;
+    float outG = srcG + (g - srcG) * strength;
+    float outB = srcB + (b - srcB) * strength;
+    return make_float3(outR, outG, outB);
+}

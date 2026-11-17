@@ -1,0 +1,48 @@
+// BHS Skin Vibrance
+// Boosts the dull colors in the image and leaves skin tones alone, so portraits stay natural.
+
+DEFINE_UI_PARAMS(vibrance, Vibrance, DCTLUI_SLIDER_FLOAT, 0.4, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(skin_protect, Skin Protection, DCTLUI_SLIDER_FLOAT, 0.8, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(skin_hue, Skin Hue Center, DCTLUI_SLIDER_FLOAT, 25.0, 0.0, 60.0, 1.0)
+DEFINE_UI_PARAMS(skin_range, Skin Hue Range, DCTLUI_SLIDER_FLOAT, 28.0, 5.0, 60.0, 1.0)
+DEFINE_UI_PARAMS(saturation, Global Saturation, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+
+__DEVICE__ float bhs_smooth(float a, float b, float x)
+{
+    float t = _fminf(_fmaxf((x - a) / (b - a), 0.0f), 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float mx = _fmaxf(p_R, _fmaxf(p_G, p_B));
+    float mn = _fminf(p_R, _fminf(p_G, p_B));
+    float d = mx - mn;
+    float sat = (mx > 0.0001f) ? d / mx : 0.0f;
+
+    // hue in degrees (0..360)
+    float h = 0.0f;
+    if (d > 0.0001f) {
+        if (mx == p_R)      h = (p_G - p_B) / d;
+        else if (mx == p_G) h = 2.0f + (p_B - p_R) / d;
+        else                h = 4.0f + (p_R - p_G) / d;
+        h = h * 60.0f;
+        if (h < 0.0f) h = h + 360.0f;
+    }
+
+    // distance from skin hue, wrapping around the color wheel
+    float dh = _fabs(h - skin_hue);
+    if (dh > 180.0f) dh = 360.0f - dh;
+    float skinW = 1.0f - bhs_smooth(skin_range * 0.5f, skin_range, dh);
+    float protect = skinW * skin_protect;
+
+    // vibrance affects low-saturation colors more
+    float amt = vibrance * (1.0f - sat) * (1.0f - protect);
+    float s = (1.0f + amt) * saturation;
+
+    float luma = 0.2126f * p_R + 0.7152f * p_G + 0.0722f * p_B;
+    float r = luma + (p_R - luma) * s;
+    float g = luma + (p_G - luma) * s;
+    float b = luma + (p_B - luma) * s;
+    return make_float3(r, g, b);
+}
