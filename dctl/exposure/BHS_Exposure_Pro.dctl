@@ -2,33 +2,26 @@
 // Full exposure and balance tool: Exposure, Contrast, Highlights, Shadows, Whites, Blacks, Midtones,
 // Saturation and Highlight Roll-off, plus built-in False Color, Clipping Warning and Zone Mask views.
 //
-// How to use: put it on a node BEFORE your look. Set Input Space to match the footage on that node,
-// then use View Mode to judge exposure and set it back to "Off" when you are done.
-//   Linear  : scene-linear footage (e.g. after a Color Space Transform to linear)
-//   Gamma24 : display-referred footage (Rec.709 / sRGB-ish, camera "standard" profiles)
+// How to use: put it on a node before your look. Set Input Space to match the footage on that node,
+// then use View Mode to judge exposure and set it back to Off when you are done.
+//   Linear     : scene-linear footage
+//   Gamma24    : display-referred footage (Rec.709 or sRGB style)
 //   DaVinciInt : DaVinci Intermediate (DaVinci Wide Gamut timeline)
 // All tonal sliders work in stops on luminance only, so hue and colour ratios are preserved.
 
 DEFINE_UI_PARAMS(inputSpace, Input Space, DCTLUI_COMBO_BOX, 2, { SP_LINEAR, SP_GAMMA24, SP_DAVINCI }, { Linear, Gamma24, DaVinciInt })
-DEFINE_UI_PARAMS(exposure, Exposure (stops), DCTLUI_SLIDER_FLOAT, 0.0, -6.0, 6.0, 0.01)
+DEFINE_UI_PARAMS(expo, Exposure, DCTLUI_SLIDER_FLOAT, 0.0, -6.0, 6.0, 0.01)
 DEFINE_UI_PARAMS(contrast, Contrast, DCTLUI_SLIDER_FLOAT, 1.0, 0.5, 2.0, 0.01)
-DEFINE_UI_PARAMS(pivot, Contrast Pivot (linear), DCTLUI_SLIDER_FLOAT, 0.18, 0.02, 0.6, 0.005)
+DEFINE_UI_PARAMS(pivot, Contrast Pivot, DCTLUI_SLIDER_FLOAT, 0.18, 0.02, 0.6, 0.005)
 DEFINE_UI_PARAMS(whites, Whites, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(highlights, Highlights, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(midtones, Midtones, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(shadows, Shadows, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(blacks, Blacks, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
-DEFINE_UI_PARAMS(rolloff, Highlight Roll-off, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
-DEFINE_UI_PARAMS(rolloff_start, Roll-off Start, DCTLUI_SLIDER_FLOAT, 0.6, 0.2, 0.95, 0.01)
-DEFINE_UI_PARAMS(saturation, Saturation, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+DEFINE_UI_PARAMS(rolloff, Highlight Rolloff, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(rollStart, Rolloff Start, DCTLUI_SLIDER_FLOAT, 0.6, 0.2, 0.95, 0.01)
+DEFINE_UI_PARAMS(sat, Saturation, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
 DEFINE_UI_PARAMS(viewMode, View Mode, DCTLUI_COMBO_BOX, 0, { VM_OFF, VM_FALSE, VM_CLIP, VM_ZONES }, { Off, FalseColor, ClipWarning, ZoneMasks })
-
-#define BHS_DI_A 0.0075f
-#define BHS_DI_B 7.0f
-#define BHS_DI_C 0.07329248f
-#define BHS_DI_M 10.44426855f
-#define BHS_DI_LIN_CUT 0.00262409f
-#define BHS_DI_LOG_CUT 0.02740668f
 
 __DEVICE__ float bhs_smooth(float a, float b, float x)
 {
@@ -40,16 +33,14 @@ __DEVICE__ float bhs_to_linear(float v, int space)
 {
     if (space == 0) return v;
     if (space == 1) return _powf(_fmaxf(v, 0.0f), 2.4f);
-    if (v <= BHS_DI_LOG_CUT) return v / BHS_DI_M;
-    return _exp2f(v / BHS_DI_C - BHS_DI_B) - BHS_DI_A;
+    return v <= 0.02740668f ? v / 10.44426855f : _exp2f(v / 0.07329248f - 7.0f) - 0.0075f;
 }
 
 __DEVICE__ float bhs_from_linear(float v, int space)
 {
     if (space == 0) return v;
     if (space == 1) return _powf(_fmaxf(v, 0.0f), 1.0f / 2.4f);
-    if (v <= BHS_DI_LIN_CUT) return v * BHS_DI_M;
-    return (_log2f(v + BHS_DI_A) + BHS_DI_B) * BHS_DI_C;
+    return v <= 0.00262409f ? v * 10.44426855f : (_log2f(v + 0.0075f) + 7.0f) * 0.07329248f;
 }
 
 // Perceptual lightness (0..1) of a linear luminance, used only to build the tonal masks.
@@ -60,97 +51,104 @@ __DEVICE__ float bhs_percep(float y)
 
 __DEVICE__ float3 bhs_false_color(float y)
 {
-    float e = bhs_percep(y); // display-like value, 0..1
-    if (y > 1.0f)   return make_float3(1.0f, 0.0f, 0.0f);   // clipped
-    if (e < 0.02f)  return make_float3(0.35f, 0.0f, 0.55f); // crushed black
-    if (e < 0.08f)  return make_float3(0.0f, 0.15f, 0.85f); // deep shadow
-    if (e < 0.25f)  return make_float3(0.0f, 0.6f, 0.75f);  // shadow
-    if (e < 0.38f)  return make_float3(e, e, e);            // low mid (grey)
-    if (e < 0.47f)  return make_float3(0.0f, 0.75f, 0.2f);  // middle grey zone
-    if (e < 0.62f)  return make_float3(e, e, e);            // mid (grey)
-    if (e < 0.75f)  return make_float3(0.95f, 0.6f, 0.7f);  // skin / bright mid (pink)
-    if (e < 0.88f)  return make_float3(1.0f, 0.9f, 0.1f);   // highlight
-    if (e < 0.97f)  return make_float3(1.0f, 0.5f, 0.0f);   // hot highlight
-    return make_float3(1.0f, 0.0f, 0.0f);                   // about to clip
+    float e = bhs_percep(y);
+    float3 o = make_float3(e, e, e);
+    if (y > 1.0f)        o = make_float3(1.0f, 0.0f, 0.0f);
+    else if (e < 0.02f)  o = make_float3(0.35f, 0.0f, 0.55f);
+    else if (e < 0.08f)  o = make_float3(0.0f, 0.15f, 0.85f);
+    else if (e < 0.25f)  o = make_float3(0.0f, 0.6f, 0.75f);
+    else if (e < 0.38f)  o = make_float3(e, e, e);
+    else if (e < 0.47f)  o = make_float3(0.0f, 0.75f, 0.2f);
+    else if (e < 0.62f)  o = make_float3(e, e, e);
+    else if (e < 0.75f)  o = make_float3(0.95f, 0.6f, 0.7f);
+    else if (e < 0.88f)  o = make_float3(1.0f, 0.9f, 0.1f);
+    else if (e < 0.97f)  o = make_float3(1.0f, 0.5f, 0.0f);
+    else                 o = make_float3(1.0f, 0.0f, 0.0f);
+    return o;
 }
 
 __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
 {
-    float3 c = make_float3(bhs_to_linear(p_R, inputSpace), bhs_to_linear(p_G, inputSpace), bhs_to_linear(p_B, inputSpace));
+    float cr = bhs_to_linear(p_R, inputSpace);
+    float cg = bhs_to_linear(p_G, inputSpace);
+    float cb = bhs_to_linear(p_B, inputSpace);
 
     // 1. Exposure in stops
-    float eg = _exp2f(exposure);
-    c.x *= eg; c.y *= eg; c.z *= eg;
+    float eg = _exp2f(expo);
+    cr = cr * eg;
+    cg = cg * eg;
+    cb = cb * eg;
 
-    // 2. Luminance (Rec.709 weights on the working RGB)
-    float y = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+    // 2. Luminance and perceptual lightness
+    float y = 0.2126f * cr + 0.7152f * cg + 0.0722f * cb;
     float L = bhs_percep(y);
 
-    // 3. Tonal masks (overlapping, smooth)
-    float m_blacks = 1.0f - bhs_smooth(0.0f, 0.22f, L);
-    float m_shadows = 1.0f - bhs_smooth(0.12f, 0.58f, L);
-    float m_mids = 1.0f - _fabsf(2.0f * L - 1.0f);
-    m_mids = m_mids * m_mids * (3.0f - 2.0f * m_mids);
-    float m_highs = bhs_smooth(0.42f, 0.9f, L);
-    float m_whites = bhs_smooth(0.72f, 1.0f, L);
+    // 3. Tonal masks
+    float mBlacks = 1.0f - bhs_smooth(0.0f, 0.22f, L);
+    float mShadows = 1.0f - bhs_smooth(0.12f, 0.58f, L);
+    float mMid = 1.0f - _fabsf(2.0f * L - 1.0f);
+    mMid = mMid * mMid * (3.0f - 2.0f * mMid);
+    float mHighs = bhs_smooth(0.42f, 0.9f, L);
+    float mWhites = bhs_smooth(0.72f, 1.0f, L);
 
-    // 4. Build one luminance gain in stops (sliders: +-1 = +-2 stops at full mask)
-    float stops = 2.0f * (shadows * m_shadows + midtones * m_mids + highlights * m_highs + whites * m_whites);
+    // 4. One luminance gain in stops (a slider at 1 is 2 stops at full mask)
+    float stops = 2.0f * (shadows * mShadows + midtones * mMid + highlights * mHighs + whites * mWhites);
     float gain = _exp2f(stops);
 
-    // 5. Contrast around the pivot (linear). Applied as a luminance gain so hue is kept.
-    if (y > 1e-6f)
-        gain *= _powf(y / pivot, contrast - 1.0f);
+    // 5. Contrast around the pivot, applied to luminance so hue is kept
+    if (y > 0.000001f) gain = gain * _powf(y / pivot, contrast - 1.0f);
 
     float yNew = y * gain;
 
-    // 6. Blacks: add or remove a small amount of linear light in the deepest tones
-    yNew += blacks * 0.02f * m_blacks;
-    yNew = _fmaxf(yNew, 0.0f);
+    // 6. Blacks
+    yNew = _fmaxf(yNew + blacks * 0.02f * mBlacks, 0.0f);
 
-    // 7. Highlight roll-off: soft knee that compresses toward 1.0 instead of clipping hard
-    if (rolloff > 0.0f && yNew > rolloff_start)
+    // 7. Highlight rolloff (soft knee toward 1.0)
+    if (rolloff > 0.0f && yNew > rollStart)
     {
-        float range = 1.0f - rolloff_start;
-        float soft = rolloff_start + range * (1.0f - _expf(-(yNew - rolloff_start) / range));
+        float range = 1.0f - rollStart;
+        float soft = rollStart + range * (1.0f - _expf(-(yNew - rollStart) / range));
         yNew = yNew + (soft - yNew) * rolloff;
     }
 
-    // 8. Apply the luminance change to RGB (ratio keeps colour), neutral offset covers y near 0
-    if (y > 1e-6f)
+    // 8. Apply the luminance change to RGB
+    float rr = yNew;
+    float rg = yNew;
+    float rb = yNew;
+    if (y > 0.000001f)
     {
-        float r = yNew / y;
-        c.x *= r; c.y *= r; c.z *= r;
-    }
-    else
-    {
-        c.x = c.y = c.z = yNew;
+        float k = yNew / y;
+        rr = cr * k;
+        rg = cg * k;
+        rb = cb * k;
     }
 
     // 9. Saturation around luminance
-    float yo = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
-    c.x = yo + (c.x - yo) * saturation;
-    c.y = yo + (c.y - yo) * saturation;
-    c.z = yo + (c.z - yo) * saturation;
+    float yo = 0.2126f * rr + 0.7152f * rg + 0.0722f * rb;
+    rr = yo + (rr - yo) * sat;
+    rg = yo + (rg - yo) * sat;
+    rb = yo + (rb - yo) * sat;
 
-    // 10. Analysis views (computed on the final result)
+    // 10. Output: normal picture, or one of the analysis views
+    float3 res = make_float3(bhs_from_linear(rr, inputSpace), bhs_from_linear(rg, inputSpace), bhs_from_linear(rb, inputSpace));
+
     if (viewMode == 1)
-        return bhs_false_color(yo);
-    if (viewMode == 2)
     {
-        float3 o = make_float3(bhs_from_linear(c.x, inputSpace), bhs_from_linear(c.y, inputSpace), bhs_from_linear(c.z, inputSpace));
-        if (c.x >= 1.0f || c.y >= 1.0f || c.z >= 1.0f) return make_float3(1.0f, 0.0f, 0.6f);
-        if (yo <= 0.0f) return make_float3(0.0f, 0.2f, 1.0f);
-        return o;
+        res = bhs_false_color(yo);
     }
-    if (viewMode == 3)
+    else if (viewMode == 2)
+    {
+        if (rr >= 1.0f || rg >= 1.0f || rb >= 1.0f) res = make_float3(1.0f, 0.0f, 0.6f);
+        else if (yo <= 0.0f) res = make_float3(0.0f, 0.2f, 1.0f);
+    }
+    else if (viewMode == 3)
     {
         float Lo = bhs_percep(yo);
         float sh = 1.0f - bhs_smooth(0.12f, 0.58f, Lo);
         float hi = bhs_smooth(0.42f, 0.9f, Lo);
         float mi = 1.0f - _fabsf(2.0f * Lo - 1.0f);
-        return make_float3(hi, mi * mi * (3.0f - 2.0f * mi), sh);
+        res = make_float3(hi, mi * mi * (3.0f - 2.0f * mi), sh);
     }
 
-    return make_float3(bhs_from_linear(c.x, inputSpace), bhs_from_linear(c.y, inputSpace), bhs_from_linear(c.z, inputSpace));
+    return make_float3(res.x, res.y, res.z);
 }

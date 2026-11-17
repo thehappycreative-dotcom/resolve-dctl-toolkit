@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.1
+- Fix: BHS Exposure Pro now loads in DaVinci Resolve. The main transform function had several return statements, and Resolve requires a single `return make_float3(...)`. Also removed `#define`s and brackets in slider labels to match the style of the BHS Pro tools.
+
 ## 1.1.0
 - Added the BHS Pro pack: 25 film, look, color, texture and utility DCTLs in `dctl/pro`, plus a guide.
 
